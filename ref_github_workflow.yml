@@ -1,0 +1,63 @@
+name: Build Windows .exe
+
+# Triggers:
+#   - manually from the Actions tab (workflow_dispatch)
+#   - on push to main / master
+#   - on git tag starting with 'v' (creates a release artifact)
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Enable long paths (needed for PySide6's deep dirs)
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build .exe
+        run: pyinstaller build_windows.spec
+
+      - name: Smoke test — does it launch?
+        # Runs the .exe with QT_QPA_PLATFORM=offscreen for ~3 seconds to confirm
+        # imports + Qt + qasync all wire up. Fails fast if the bundle is broken.
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath "dist\Scraper.exe" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 3
+          if ($proc.HasExited -and $proc.ExitCode -ne 0) {
+            Write-Error "exe crashed on launch, exit=$($proc.ExitCode)"
+            exit 1
+          }
+          if (-not $proc.HasExited) { $proc.Kill() }
+          Write-Host "Launch smoke test passed."
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scraper-windows
+          path: dist/Scraper.exe
+          retention-days: 30
+
+      - name: Create release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Scraper.exe

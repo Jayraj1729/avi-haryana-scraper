@@ -1,0 +1,49 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+.aviEnv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local settings and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Application state, scraped records and local test datasets
+/data/
+/output/
+/logs/
+/demo-files*/
+/demo-mobile-update-test-*/
+/final-demo-files*/
+/*-test-run*/
+/refrence/
+photos/
+Updated-mobileNos-*/
+Mobile-updates-*/
+.ulb-dataset.json
+.ulb-checkpoint.sqlite3*
+properties*.csv
+properties*.xlsx
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.lwp
+*.har
+*.log
+*.log.*
+*.part
+*.zip
+
+# Build outputs
+/build/
+/dist/
+*.exe

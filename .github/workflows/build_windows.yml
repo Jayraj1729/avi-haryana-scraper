@@ -1,0 +1,47 @@
+name: Build Windows Application
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller==6.19.0
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+      - name: Build
+        run: pyinstaller --noconfirm build_windows.spec
+      - name: Verify executable
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $proc = Start-Process -FilePath 'dist\ULBPropertyScraper.exe' -ArgumentList '--smoke-test', '--data-dir', 'build\smoke-state' -PassThru
+          if (-not $proc.WaitForExit(30000)) {
+            $proc.Kill()
+            throw 'Application smoke test timed out'
+          }
+          if ($proc.ExitCode -ne 0) { throw "Application exited with $($proc.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ULBPropertyScraper-Windows
+          path: dist/ULBPropertyScraper.exe
+          if-no-files-found: error
+          retention-days: 30
