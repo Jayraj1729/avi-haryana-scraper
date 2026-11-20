@@ -1,11 +1,11 @@
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=collect_submodules('Crypto.Cipher'),
+    datas=collect_data_files('certifi'),
+    hiddenimports=collect_submodules('Crypto.Cipher') + ['truststore._windows'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

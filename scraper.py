@@ -22,9 +22,13 @@ import math
 from pathlib import Path
 import re
 import shutil
+import ssl
 import sys
 import time
 from urllib import error, parse, request
+
+# Third Party Imports
+import certifi
 
 BASEURL = 'https://property.ulbharyana.gov.in'
 SESSIONFILE = Path('data/session_state.json')
@@ -225,6 +229,30 @@ def makeCookie(name, value, domain):
     )
 
 
+def createPortalSslContext():
+    '''
+    Configure verified HTTPS with system trust and bundled public CA roots.
+
+    Inputs:    None
+
+    Output:    TLS client context with certificate and hostname verification
+    '''
+    logging.debug('Configuring portal HTTPS certificate trust')
+    # Windows native validation can retrieve missing intermediates and use
+    # trusted roots installed by Windows or a managed network administrator.
+    if sys.platform == 'win32':
+        import truststore
+
+        context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_default_certs()
+    else:
+        context = ssl.create_default_context()
+    # Include public roots in the executable instead of relying exclusively
+    # on the target laptop's Python/OpenSSL certificate paths.
+    context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
 class PortalSession:
     '''
     Lightweight HTTP client for the ULB Haryana portal.
@@ -240,7 +268,9 @@ class PortalSession:
             self.cookieJar.load(ignore_discard=True, ignore_expires=True)
         elif cookieFile is None and SESSIONFILE.exists():
             self._importStorageStateCookies()
-        self.opener = request.build_opener(request.HTTPCookieProcessor(self.cookieJar))
+        self.opener = request.build_opener(
+            request.HTTPCookieProcessor(self.cookieJar),
+            request.HTTPSHandler(context=createPortalSslContext()))
 
     def _importStorageStateCookies(self):
         '''

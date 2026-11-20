@@ -261,6 +261,13 @@ pip install pyinstaller
 pyinstaller --noconfirm build_windows.spec
 ```
 
+HTTPS uses Windows' native certificate validation and a bundled public CA list.
+Certificate and hostname checks remain enabled for login, scraping and photos.
+If an older executable reports `CERTIFICATE_VERIFY_FAILED`, rebuild through
+Actions after pulling the certificate-trust fix and download the new artifact.
+If it persists, check the laptop's date/time and Windows trusted certificate
+updates. Managed networks may require their administrator's trusted CA.
+
 ## CLI Login
 
 ```bash

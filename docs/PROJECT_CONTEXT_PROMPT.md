@@ -2,6 +2,13 @@
 
 Context snapshot: 20 November 2026.
 
+Windows HTTPS uses a shared explicit HTTPSHandler: native Windows certificate
+validation through truststore plus certifi public roots bundled by PyInstaller.
+Other platforms retain default system trust with the same supplementary roots.
+Certificate and hostname verification stay enabled. All client clones and photo
+downloads inherit this transport. Requirements pin certifi and truststore; the
+Windows offline smoke test constructs the transport without sending an OTP.
+
 November 20 update: imports fetch each municipality's colony catalog once and
 reuse it for all imported colonies. Confirmation checks file fingerprints rather
 than parsing CSV/XLSX snapshots again. Validation, import and deletion show
