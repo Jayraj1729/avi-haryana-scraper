@@ -78,6 +78,41 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.window.operationPanel.isHidden())
         self.assertTrue(self.window.tree.isEnabled())
 
+    def testMunicipalityExportButtonQueuesOnlyAfterConfirmation(self):
+        self.addColony()
+        self.window.refreshJobs()
+        parent = self.window.groupItems['60']
+        widget = self.window.tree.itemWidget(parent, 0)
+        self.assertIsNotNone(widget)
+        self.assertEqual(self.window.groupExportLabels['60'].text(), 'Last exported: Never')
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Cancel), \
+                patch.object(self.window, 'request') as request:
+            self.window.exportMunicipality('60')
+        request.assert_not_called()
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Ok):
+            self.window.exportMunicipality('60')
+        self.assertIn('exportMunicipality', self.window.busyActions)
+        self.assertFalse(self.window.tree.isEnabled())
+        self.assertFalse(self.window.operationPanel.isHidden())
+        action, payload = self.window.engine.commands.get_nowait()
+        self.assertEqual(action, 'exportMunicipality')
+        self.assertEqual(payload['municipalityId'], '60')
+        self.assertTrue(str(payload['destinationRoot']).endswith('exports'))
+        self.window.handleEvent('actionFinished', 'exportMunicipality')
+        self.assertTrue(self.window.tree.isEnabled())
+
+    def testMunicipalityExportCompletionShowsFilenameCountAndLastExportTime(self):
+        self.addColony()
+        self.window.refreshJobs()
+        result = {'municipalityId': '60', 'municipalityName': 'PANCHKULA', 'rows': 1234,
+                  'filename': 'panchkula_timestamp.xlsx', 'path': str(self.home / 'Master' / 'panchkula_timestamp.xlsx'),
+                  'exportedAt': '2026-11-23T15:30:00+05:30'}
+        with patch.object(QMessageBox, 'exec', return_value=0) as show:
+            self.window.handleEvent('municipalityExported', result)
+        show.assert_called_once()
+        self.assertIn('23 Nov 2026, 15:30 IST', self.window.groupExportLabels['60'].text())
+        self.assertEqual(self.window.operationProgress.value(), 100)
+
     def testUpdateOptionsPassMissingMobileChoiceToValidation(self):
         def chooseMobileOnly(dialog):
             dialog.findChild(QCheckBox).setChecked(True)
@@ -309,6 +344,20 @@ class GuiTests(unittest.TestCase):
         combo.hidePopup()
         self.window.loadMunicipalities()
         self.assertEqual(set(combo.selectedValues()), {'60', '61'})
+
+    def testSelectionCountsExcludeHeadingsAndInactiveEntriesAndSurviveSearch(self):
+        combo = self.window.municipality
+        combo.addItem('Unavailable', 'inactive')
+        combo.model().item(combo.findData('inactive')).setEnabled(False)
+        combo.addItem('Group heading')
+        combo.setSelectedValues(['60'])
+        self.assertEqual(combo.selectionSummary(), '1 selected / 2')
+        combo.searchInput.setText('panch')
+        self.assertEqual(combo.selectionCount.text(), '1 selected / 2')
+        combo.setSelectedValues(['ALL'])
+        self.assertEqual(combo.selectionCount.text(), '2 selected / 2')
+        combo.setSelectedValues([])
+        self.assertEqual(combo.selectionCount.text(), '0 selected / 2')
 
     def testGroupedCheckedColoniesAddExactPairsAndStayIdempotent(self):
         self.window.engine.client = CatalogClient()

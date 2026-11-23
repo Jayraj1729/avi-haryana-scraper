@@ -19,6 +19,7 @@ from scraper import (AuthenticationError, BASEURL, buildRectWkt,
 from ulb_scraper import datasets
 from ulb_scraper.exporter import exportJob
 from ulb_scraper.geometry import containsProperty, readBoundary, seedBounds, splitBounds
+from ulb_scraper.municipality_export import exportMunicipality
 from ulb_scraper.portal import PortalClient, propertyPhotoUrls
 from ulb_scraper.property_data import publicViewRestricted
 from ulb_scraper.traffic import TrafficController
@@ -85,6 +86,7 @@ class Engine(threading.Thread):
         self.forceExport = set()
         self.publishedCounts = {}
         self.retainedExports = store.retainedExportJobs()
+        self.municipalityExport = None
 
     def submit(self, action, **payload):
         '''Queue a worker operation. Inputs: <action>, [payload]. Output: None.'''
@@ -223,13 +225,16 @@ class Engine(threading.Thread):
         logging.info('Starting parallel scraper coordinator')
         self.store.waitForLogin()
         with ThreadPoolExecutor(max_workers=100, thread_name_prefix='colony') as workers, \
-                ThreadPoolExecutor(max_workers=1, thread_name_prefix='excel') as writer:
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='excel') as writer, \
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='municipality-export') as masterWriter:
             self.writer = writer
+            self.masterWriter = masterWriter
             try:
                 self.restoreSession()
                 while not self.stopEvent.is_set():
                     try:
                         self.collectWork()
+                        self.collectMunicipalityExport()
                         try:
                             action, payload = self.commands.get_nowait()
                         except queue.Empty:
@@ -259,6 +264,7 @@ class Engine(threading.Thread):
             finally:
                 workers.shutdown(wait=True, cancel_futures=True)
                 self.collectWork()
+                self.collectMunicipalityExport(wait=True)
                 if self.exportFuture:
                     self.exportFuture.result()
                     self.exportFuture = None
@@ -471,6 +477,8 @@ class Engine(threading.Thread):
         logging.info(f'Processing application action {action}')
         operationStarted = time.monotonic()
         try:
+            if self.municipalityExport and action in ('add', 'delete', 'importDataset'):
+                raise ValueError('Wait for the municipality export to finish before changing dataset folders or jobs')
             if action == 'generateOtp':
                 challenge = self.clientFactory(cookieFile=self.home / 'cookies.lwp', fresh=True, persist=False)
                 self.network(challenge.generateOtp, payload['phone'])
@@ -518,6 +526,8 @@ class Engine(threading.Thread):
                 self.emit('datasetInspected', inventory)
             elif action == 'importDataset':
                 self.importDataset(**payload)
+            elif action == 'exportMunicipality':
+                self.beginMunicipalityExport(**payload)
             elif action == 'delete':
                 self.operationProgress(0, 0, 'Stopping selected jobs safely')
                 selectedIds = set(payload['jobIds'])
@@ -546,7 +556,58 @@ class Engine(threading.Thread):
             self.emit('actionFailed', {'action': action, 'message': str(exception)})
         finally:
             logging.info(f'Finished application action {action} in {time.monotonic() - operationStarted:.2f}s')
-            self.emit('actionFinished', action)
+            if action != 'exportMunicipality' or self.municipalityExport is None:
+                self.emit('actionFinished', action)
+
+    def beginMunicipalityExport(self, municipalityId, destinationRoot=None):
+        '''Pause the selected municipality before its background export begins.'''
+        logging.info('Preparing municipality master export')
+        if self.municipalityExport:
+            raise ValueError('A municipality export is already in progress')
+        jobs = [job for job in self.store.jobs() if job['municipalityId'] == municipalityId]
+        if not jobs:
+            raise ValueError('No queued colonies were found for this municipality')
+        roots = {str(Path(job['folder']).resolve().parent.parent) for job in jobs}
+        if destinationRoot is None:
+            if len(roots) != 1:
+                raise ValueError('Choose an output root for the Master folder')
+            destinationRoot = next(iter(roots))
+        self.store.control([job['id'] for job in jobs
+                            if job['status'] not in ('complete', 'complete_warnings')], 'pause')
+        self.municipalityExport = {'jobs': jobs, 'root': destinationRoot, 'future': None}
+        self.operationProgress(0, 0, 'Pausing municipality colonies and saving current work...')
+        self.emit('jobsChanged', None)
+
+    def collectMunicipalityExport(self, wait=False):
+        '''Start after scoped requests stop, then publish background completion.'''
+        pending = self.municipalityExport
+        if not pending:
+            return
+        if any(job['id'] in self.inFlight for job in pending['jobs']):
+            return
+        finished = False
+        try:
+            if pending['future'] is None:
+                pending['future'] = self.masterWriter.submit(
+                    exportMunicipality, self.store, pending['jobs'], pending['root'], self.operationProgress)
+            if not wait and not pending['future'].done():
+                return
+            finished = True
+            result = pending['future'].result()
+            history = self.store.setting('municipalityExports', {})
+            history[result['municipalityId']] = result
+            self.store.setSetting('municipalityExports', history)
+            self.emit('municipalityExported', result)
+        except Exception as exception:
+            finished = True
+            logging.exception('Municipality master export failed')
+            self.emit('actionFailed', {'action': 'exportMunicipality',
+                'message': f'Export could not finish: {exception}. Close any open municipality workbook and try again. '
+                           'The municipality stays paused.'})
+        finally:
+            if finished:
+                self.municipalityExport = None
+                self.emit('actionFinished', 'exportMunicipality')
 
     def operationProgress(self, current, total, message):
         '''Report long operations without flooding the UI. Inputs: <current>, <total>, <message>.'''

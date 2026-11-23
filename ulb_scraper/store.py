@@ -14,7 +14,7 @@ import uuid
 from scraper import propertyIdentity, slugify
 from ulb_scraper import datasets
 from ulb_scraper.exporter import formatFetchedAt, iterExportRows, propertyExportRow
-from ulb_scraper.property_data import EXPORTVERSION, PARSERVERSION, publicViewRestricted, usable
+from ulb_scraper.property_data import compactExportRow, EXPORTVERSION, PARSERVERSION, publicViewRestricted, usable
 
 
 SCHEMA = '''
@@ -461,7 +461,7 @@ class Store:
         if mobileOnly:
             targets = [(jobId, baseline['pid']) for baseline in connection.execute(
                 'SELECT pid,row FROM baselines WHERE jobId=?', (jobId,))
-                if not usable(json.loads(baseline['row']).get('Mobile Numbers'))]
+                if not usable(compactExportRow(json.loads(baseline['row']), peopleCombined=True).get('Mobile Numbers'))]
             connection.executemany('UPDATE baselines SET mobileTarget=1 WHERE jobId=? AND pid=?', targets)
         connection.execute('UPDATE jobs SET updateScope=?,mobileReportRoot=? WHERE id=?',
                            ('missing_mobile' if mobileOnly else 'all', reportRoot if mobileOnly else '', jobId))

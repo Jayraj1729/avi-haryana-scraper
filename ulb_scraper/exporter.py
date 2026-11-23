@@ -121,7 +121,7 @@ def exportJob(store, job, mobileReport=False):
         with store.connect() as connection:
             connection.execute('BEGIN')
             version = connection.execute('SELECT dataVersion FROM jobs WHERE id=?', (job['id'],)).fetchone()[0]
-            available = {'PID', 'Municipality', 'Colony', 'Owner 1: Name', 'Mobile Numbers', 'Data Fetched At (IST)'}
+            available = {'PID', 'State', 'Municipality', 'Colony', 'Owner 1: Name', 'Mobile Numbers', 'Data Fetched At (IST)'}
             nonEmpty = set()
             for row in iterExportRows(connection, job['id'], job, mobileReport=mobileReport):
                 available.update(row)

@@ -139,6 +139,7 @@ def inspectDataset(root, progress=None):
         if progress:
             progress(0, 0, f'Validating {municipality.name}')
         if (not municipality.is_dir() or municipality.name.startswith(('.', '_')) or
+                municipality.name.casefold() in ('master', 'exported') or
                 municipality.name.casefold().startswith(('updated-mobilenos-', 'mobile-updates-'))):
             continue
         for colony in sorted(municipality.iterdir()):
@@ -225,6 +226,7 @@ def revalidateDataset(inventory, progress=None):
     folders = set()
     for municipality in root.iterdir():
         if (not municipality.is_dir() or municipality.name.startswith(('.', '_')) or
+                municipality.name.casefold() in ('master', 'exported') or
                 municipality.name.casefold().startswith(('updated-mobilenos-', 'mobile-updates-'))):
             continue
         for colony in municipality.iterdir():

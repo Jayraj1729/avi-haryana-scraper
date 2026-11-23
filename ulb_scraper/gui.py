@@ -2,19 +2,20 @@
 
 # Standard Library Imports
 from collections import deque
+from datetime import datetime
 import logging
 from pathlib import Path
 import sys
 import time
 
 # Third Party Imports
-from PySide6.QtCore import QEvent, QObject, QRect, QRegularExpression, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QRegularExpression, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
                               QDialog, QDialogButtonBox, QFileDialog,
                               QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
                               QLineEdit, QListView, QMainWindow, QMenu, QMessageBox, QPushButton,
-                              QProgressBar, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStylePainter,
+                              QProgressBar, QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStylePainter,
                               QSystemTrayIcon, QToolButton, QToolTip,
                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -86,6 +87,8 @@ class SearchCheckCombo(QComboBox):
         self.options.viewport().installEventFilter(self)
         self.options.installEventFilter(self)
         layout.addWidget(self.options)
+        self.selectionCount = QLabel()
+        layout.addWidget(self.selectionCount)
         self.searchInput.installEventFilter(self)
         self.searchInput.textChanged.connect(self.filterOptions)
         self.currentIndexChanged.connect(self.selectSingle)
@@ -123,7 +126,21 @@ class SearchCheckCombo(QComboBox):
             self.setCurrentIndex(first)
         finally:
             self.updating = False
+        self.selectionCount.setText(self.selectionSummary())
         self.update()
+
+    def selectionSummary(self):
+        '''Count active catalog entries, excluding ALL and group headings.'''
+        logging.debug('Counting catalog selections')
+        total = 0
+        selected = 0
+        for index in range(self.count()):
+            item = self.model().item(index)
+            if not self.itemData(index) or self.itemData(index) == 'ALL' or not item.isEnabled():
+                continue
+            total += 1
+            selected += item.checkState() == Qt.CheckState.Checked
+        return f'{selected} selected / {total}'
 
     def selectSingle(self, index):
         '''Support a direct single selection. Inputs: <index>. Output: None.'''
@@ -155,11 +172,13 @@ class SearchCheckCombo(QComboBox):
         logging.debug('Filtering catalog options')
         for index in range(self.count()):
             self.options.setRowHidden(index, query.casefold() not in self.itemText(index).casefold())
+        self.selectionCount.setText(self.selectionSummary())
 
     def showPopup(self):
         '''Open a searchable checklist. Inputs: None. Output: None.'''
         logging.debug('Opening catalog checklist')
         self.searchInput.clear()
+        self.selectionCount.setText(self.selectionSummary())
         self.popup.resize(max(380, self.width()), 360)
         self.popup.move(self.mapToGlobal(self.rect().bottomLeft()))
         screen = self.screen().availableGeometry()
@@ -212,9 +231,8 @@ class SearchCheckCombo(QComboBox):
         painter = QStylePainter(self)
         option = QStyleOptionComboBox()
         self.initStyleOption(option)
-        values = self.selectedValues()
-        if len(values) > 1:
-            option.currentText = f'{len(values)} selected'
+        if self.selectedValues():
+            option.currentText = self.selectionSummary()
         painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
         painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
 
@@ -287,6 +305,8 @@ class MainWindow(QMainWindow):
         self.closing = False
         self.jobItems = {}
         self.groupItems = {}
+        self.groupExportLabels = {}
+        self.municipalityExports = self.store.setting('municipalityExports', {})
         self.jobsById = {}
         self.speedSamples = deque()
         self.previousCompleted = {}
@@ -426,7 +446,7 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderLabels(['Municipality / Colony', 'Status', 'Map coverage', 'Properties', 'Actions'])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.tree.setUniformRowHeights(True)
+        self.tree.setUniformRowHeights(False)
         self.tree.setIndentation(22)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.showJobMenu)
@@ -471,6 +491,7 @@ class MainWindow(QMainWindow):
         self.operationPanel.hide()
         self.dataFolderNote = QLabel('Keep this output folder unchanged. To work with the data, copy the full folder and use the copy.')
         self.dataFolderNote.setWordWrap(True)
+        self.dataFolderNote.setStyleSheet('color: #b42318; font-weight: bold;')
         layout.addWidget(self.dataFolderNote)
         self.notice = QLabel('Checkpoints retained automatically')
         self.notice.setObjectName('notice')
@@ -504,16 +525,87 @@ class MainWindow(QMainWindow):
             return
         self.busyActions.add(action)
         self.engine.submit(action, **payload)
-        if action in ('add', 'inspectDataset', 'importDataset', 'delete'):
+        if action in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality'):
             self.tree.setEnabled(False)
             self.municipality.setEnabled(False)
             self.colony.setEnabled(False)
-        if action in ('inspectDataset', 'importDataset', 'delete'):
+        if action in ('inspectDataset', 'importDataset', 'delete', 'exportMunicipality'):
             self.operationLabel.setText({'inspectDataset': 'Validating dataset folders...',
-                'importDataset': 'Preparing update jobs...', 'delete': 'Removing jobs safely...'}[action])
+                'importDataset': 'Preparing update jobs...', 'delete': 'Removing jobs safely...',
+                'exportMunicipality': 'Preparing municipality export...'}[action])
             self.operationProgress.setRange(0, 0)
             self.operationPanel.show()
         self.updateAddButton()
+
+    def exportMunicipality(self, municipalityId):
+        '''Confirm a paused municipality snapshot and queue its master export.'''
+        logging.info('Requesting municipality master export')
+        if self.closing or self.busyActions:
+            return
+        jobs = [job for job in self.jobsById.values() if job['municipalityId'] == municipalityId]
+        if not jobs:
+            return
+        name = jobs[0]['municipalityName']
+        if QMessageBox.question(self, 'Export municipality',
+                f'Pause {name} colonies and export all saved properties collected so far? '
+                'Saved colonies removed from the queue will also be included. '
+                'Export again to include future updates. You can resume scraping after the export.',
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok) != QMessageBox.StandardButton.Ok:
+            return
+        roots = {str(Path(job['folder']).resolve().parent.parent) for job in jobs}
+        root = next(iter(roots))
+        if len(roots) > 1:
+            root = QFileDialog.getExistingDirectory(self, 'Choose output root for the Master folder', root)
+            if not root:
+                return
+        self.request('exportMunicipality', municipalityId=municipalityId, destinationRoot=root)
+
+    def municipalityExportComplete(self, result):
+        '''Show the saved workbook, row count and an Open folder shortcut.'''
+        logging.info('Municipality workbook saved')
+        self.municipalityExports[result['municipalityId']] = result
+        self.refreshJobs()
+        self.operationProgress.setRange(0, 100)
+        self.operationProgress.setValue(100)
+        box = QMessageBox(self)
+        box.setWindowTitle('Municipality export complete')
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f'File saved under Master:\n{result["filename"]}\n\n'
+                    f'Total property rows: {result["rows"]:,}')
+        box.setInformativeText('All saved properties collected so far are included. '
+            'Export again to include future updates. You can now resume scraping for this municipality.')
+        box.setDetailedText(result['path'])
+        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
+        openButton = box.addButton('Open folder', QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if box.clickedButton() == openButton:
+            self.openFolder(Path(result['path']).parent)
+
+    def addMunicipalityExportControl(self, parent, municipalityId, name):
+        '''Place an export button and last-export time beside the municipality.'''
+        logging.debug('Adding municipality export control')
+        widget = QWidget()
+        widget.setObjectName('municipalityExport')
+        widget.setStyleSheet('QWidget#municipalityExport { background: #edf5f1; }')
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(10)
+        label = QLabel(name)
+        label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(label)
+        button = QPushButton('Export Excel')
+        button.setStyleSheet('padding: 3px 6px; font-size: 11px;')
+        button.setToolTip('Pause this municipality and export all saved colony data to Master')
+        button.clicked.connect(lambda checked=False: self.exportMunicipality(municipalityId))
+        layout.addWidget(button)
+        lastExport = QLabel()
+        lastExport.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        lastExport.setStyleSheet('font-size: 10px; color: #53666c;')
+        layout.addWidget(lastExport, 1)
+        parent.setSizeHint(0, QSize(0, 46))
+        self.tree.setItemWidget(parent, 0, widget)
+        self.groupExportLabels[municipalityId] = lastExport
 
     def generateOtp(self):
         '''Validate phone and generate an OTP. Inputs: None. Output: None.'''
@@ -602,7 +694,7 @@ class MainWindow(QMainWindow):
         self.colony.blockSignals(True)
         self.colony.clear()
         self.colony.setEnabled(bool(municipalities) and self.municipality.selectedValues() != ['ALL']
-                               and not self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete')))
+                               and not self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')))
         self.colony.addItem('Select colonies', '')
         if municipalities:
             self.colony.addItem('ALL colonies', 'ALL')
@@ -657,7 +749,7 @@ class MainWindow(QMainWindow):
         logging.debug('Updating Add availability')
         if not hasattr(self, 'addButton'):
             return
-        queueBusy = bool(self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete')))
+        queueBusy = bool(self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')))
         self.addButton.setEnabled(bool(self.validSession and self.selectedColonies() and not queueBusy))
         self.addButton.setText('Adding...' if 'add' in self.busyActions else 'Add')
         self.updateButton.setEnabled(not queueBusy and 'inspectDataset' not in self.busyActions)
@@ -772,7 +864,7 @@ class MainWindow(QMainWindow):
     def controlJobs(self, identifiers, action):
         '''Apply parent, child, or global start/pause controls. Inputs: <identifiers>, <action>. Output: None.'''
         logging.info(f'Applying {action} control')
-        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete')):
+        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
             return
         self.store.control(identifiers, action)
         self.refreshJobs()
@@ -797,7 +889,7 @@ class MainWindow(QMainWindow):
     def dispatchAction(self, identity, isGroup, action):
         '''Resolve current job membership when a row action is activated. Inputs: <identity>, <isGroup>, <action>.'''
         logging.info(f'Activating row action {action}')
-        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete')):
+        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
             return
         identifiers = self.groupIds(identity) if isGroup else [identity]
         if action in ('start', 'pause'):
@@ -824,6 +916,9 @@ class MainWindow(QMainWindow):
             entry.setEnabled(delegate.enabled(action, jobs))
             entry.triggered.connect(lambda checked=False, command=action:
                                     self.dispatchAction(identity, isGroup, command))
+        if isGroup:
+            entry = menu.addAction('Export municipality Excel')
+            entry.triggered.connect(lambda checked=False: self.exportMunicipality(identity))
         menu.exec(self.tree.viewport().mapToGlobal(position))
 
     def refreshJobs(self):
@@ -855,6 +950,7 @@ class MainWindow(QMainWindow):
                 parent.setData(0, Qt.ItemDataRole.UserRole, job['municipalityId'])
                 parent.setData(0, Qt.ItemDataRole.UserRole + 1, True)
                 self.groupItems[job['municipalityId']] = parent
+                self.addMunicipalityExportControl(parent, job['municipalityId'], job['municipalityName'])
                 parent.setExpanded(len(self.groupItems) == 1)
             item = self.jobItems.get(job['id'])
             if item is None:
@@ -868,6 +964,7 @@ class MainWindow(QMainWindow):
         for municipalityId in list(self.groupItems):
             if municipalityId not in grouped:
                 parent = self.groupItems.pop(municipalityId)
+                self.groupExportLabels.pop(municipalityId, None)
                 self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(parent))
             else:
                 self.updateGroupItem(self.groupItems[municipalityId], grouped[municipalityId])
@@ -947,6 +1044,16 @@ class MainWindow(QMainWindow):
     def updateGroupItem(self, parent, jobs):
         '''Aggregate a municipality's jobs and scoped controls. Inputs: <parent>, <jobs>. Output: None.'''
         logging.debug('Rendering municipality totals')
+        municipalityId = jobs[0]['municipalityId']
+        exported = self.municipalityExports.get(municipalityId)
+        lastExport = 'Never'
+        if exported:
+            lastExport = datetime.fromisoformat(exported['exportedAt']).strftime('%d %b %Y, %H:%M IST')
+        label = self.groupExportLabels[municipalityId]
+        text = f'Last exported: {lastExport}'
+        if label.text() != text:
+            label.setText(text)
+            label.setToolTip(f'{text}\n{exported["path"]}' if exported else 'Export all saved properties collected so far')
         active = sum(bool(job['desired']) for job in jobs)
         complete = sum(job['status'] in ('complete', 'complete_warnings') for job in jobs)
         coverage = sum(job['coverage'] for job in jobs) / len(jobs) * 100
@@ -1040,7 +1147,7 @@ class MainWindow(QMainWindow):
             total = payload['total']
             self.operationProgress.setRange(0, total if total > 0 else 0)
             self.operationProgress.setValue(payload['current'] if total > 0 else 0)
-            if self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete')):
+            if self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
                 self.operationPanel.show()
         elif event == 'traffic':
             self.trafficState = payload
@@ -1093,12 +1200,14 @@ class MainWindow(QMainWindow):
         elif event == 'datasetImported':
             self.folder.setText(payload)
             self.store.setSetting('outputFolder', payload)
+        elif event == 'municipalityExported':
+            self.municipalityExportComplete(payload)
         elif event in ('notice', 'error'):
             self.notice.setText(payload)
         elif event == 'actionFailed':
             self.notice.setText(payload['message'])
-            if payload['action'] in ('inspectDataset', 'importDataset'):
-                QMessageBox.warning(self, 'Dataset update', payload['message'])
+            if payload['action'] in ('inspectDataset', 'importDataset', 'exportMunicipality'):
+                QMessageBox.warning(self, 'Municipality export' if payload['action'] == 'exportMunicipality' else 'Dataset update', payload['message'])
             if payload['action'] == 'verifyOtp' and self.otpDialog:
                 self.otpDialog.message.setText(payload['message'])
                 self.otpDialog.verify.setEnabled(True)
@@ -1108,13 +1217,13 @@ class MainWindow(QMainWindow):
             if payload == 'generateOtp':
                 self.otpButton.setEnabled(True)
                 self.phone.setEnabled(True)
-            if payload in ('add', 'inspectDataset', 'importDataset', 'delete') and not self.busyActions.intersection(
-                    ('add', 'inspectDataset', 'importDataset', 'delete')):
+            if payload in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality') and not self.busyActions.intersection(
+                    ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
                 self.tree.setEnabled(True)
                 self.municipality.setEnabled(True)
                 self.colony.setEnabled(bool(self.selectedMunicipalities()) and
                                        self.municipality.selectedValues() != ['ALL'])
-            if not self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete')):
+            if not self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
                 self.operationPanel.hide()
             self.updateAddButton()
         elif event == 'stopped' and self.closing:
@@ -1164,7 +1273,7 @@ class MainWindow(QMainWindow):
         logging.debug('Fitting table columns')
         otherWidth = sum(self.tree.columnWidth(column) for column in range(1, 5)
                          if not self.tree.isColumnHidden(column))
-        self.tree.setColumnWidth(0, max(225, self.tree.viewport().width() - otherWidth - 2))
+        self.tree.setColumnWidth(0, max(325, self.tree.viewport().width() - otherWidth - 2))
 
 
 class JobItem(QTreeWidgetItem):

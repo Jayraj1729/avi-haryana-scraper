@@ -2,6 +2,7 @@
 
 # Standard Library Imports
 import csv
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -156,6 +157,21 @@ class MobileUpdateTests(unittest.TestCase):
         jobId = self.startUpdate()
         self.assertEqual(self.store.job(jobId)['status'], 'complete')
         self.assertFalse(any(call.startswith('details:') for call in self.engine.client.calls))
+
+    def testLegacyInvalidNumberIsEligibleForMissingMobileUpdate(self):
+        jobId = self.startUpdate()
+        # Simulate a baseline saved by an older version, before validation.
+        with self.store.connect() as connection:
+            baseline = json.loads(connection.execute(
+                "SELECT row FROM baselines WHERE jobId=? AND pid='EMPTY'", (jobId,)).fetchone()['row'])
+            baseline['Mobile Numbers'] = '123456789, 00XXXXX001, 1111111111, +91 0000000000'
+            connection.execute("UPDATE baselines SET row=? WHERE jobId=? AND pid='EMPTY'",
+                               (json.dumps(baseline), jobId))
+        self.engine.importDataset(datasets.inspectDataset(self.root), restart=True, mobileOnly=True)
+        with self.store.connect() as connection:
+            targets = {row['pid']: row['mobileTarget'] for row in connection.execute(
+                'SELECT pid,mobileTarget FROM baselines WHERE jobId=?', (jobId,))}
+        self.assertEqual(targets, {'EMPTY': 1, 'KNOWN': 0, 'STILL_EMPTY': 1})
 
     def testOneCatalogCallPerMunicipalityAndVisibleProgress(self):
         other = self.root / 'town_1' / 'other_3'

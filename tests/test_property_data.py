@@ -193,17 +193,17 @@ class PropertyDataTests(unittest.TestCase):
         self.assertNotIn('Aadhar', json.dumps(row))
 
     def testColumnOrderGroupsNumericallyAndLeavesEmptyExtrasAtEnd(self):
-        available = {'PID', 'Municipality', 'Colony', 'Empty Extra', 'Useful Extra',
+        available = {'PID', 'State', 'Municipality', 'Colony', 'Empty Extra', 'Useful Extra',
                      'Owner 10: Name', 'Owner 2: Name', 'Owner 1: Gender', 'Owner 1: Name', 'Floor 1: Floor'}
         columns = orderedColumns(available, {'Useful Extra'})
-        self.assertEqual(columns[:3], ['PID', 'Municipality', 'Colony'])
+        self.assertEqual(columns[:4], ['PID', 'State', 'Municipality', 'Colony'])
         self.assertLess(columns.index('Owner 1: Name'), columns.index('Owner 1: Gender'))
         self.assertLess(columns.index('Owner 2: Name'), columns.index('Owner 10: Name'))
         self.assertLess(columns.index('Owner 10: Name'), columns.index('Floor 1: Floor'))
         self.assertEqual(columns[-1], 'Empty Extra')
 
     def testMetadataIsAlwaysAfterAllPropertyFieldsIncludingEmptyOnes(self):
-        propertyFields = {'PID', 'Municipality', 'Colony', 'Owner 1: Name',
+        propertyFields = {'PID', 'State', 'Municipality', 'Colony', 'Owner 1: Name',
                           'Floor 1: Floor', 'Address', 'Empty Extra', 'Photos', 'Photo 1'}
         trackingFields = {'Processing Status', 'Processing Error', 'Integrated Count',
                           'Integrated Count CMCDMC', 'Photo Download Status', 'Plot / House Number Source',
@@ -216,7 +216,7 @@ class PropertyDataTests(unittest.TestCase):
                         min(columns.index(label) for label in trackingFields))
         self.assertNotIn('Step1', columns)
         self.assertNotIn('Step 2', columns)
-        self.assertEqual(columns[:3], ['PID', 'Municipality', 'Colony'])
+        self.assertEqual(columns[:4], ['PID', 'State', 'Municipality', 'Colony'])
 
     def testSessionExpiredDocumentRequiresRenewalRatherThanParserRetries(self):
         with tempfile.TemporaryDirectory() as temporary:

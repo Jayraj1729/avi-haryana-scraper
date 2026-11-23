@@ -2,6 +2,38 @@
 
 Context snapshot: 20 November 2026.
 
+Export schema 9 adds constant State=Haryana immediately after PID, renames Unit
+to Plot Area Unit (while consuming legacy Unit fields), and splits every floor
+area and its adjacent unit column without losing decimal precision. Mobile
+validation also rejects ten repeated digits (0 through 9), including after
+country-prefix removal. These rules apply to colony exports, retained baselines,
+municipality master exports and missing-mobile target selection.
+
+Municipality master export: each municipality row has Export Excel and a
+persisted Last exported timestamp. It pauses that municipality and drains scoped
+requests before a separate background executor builds a disk-backed, PID-unique
+workbook. Other municipalities keep progressing. All saved sibling colonies,
+including queue-deleted portable checkpoints or legacy CSV/XLSX folders, are
+included. Live jobs use current SQLite rows; retained checkpoints are read-only.
+The newest successful PID row wins and Colony retains all memberships. Photos
+link to existing files relative to Master, with no download/copy. A timestamped
+workbook replaces the previous managed municipality file safely; export metadata
+is in Master/.municipality-ID.json and the municipalityExports app setting.
+Export details records IST time, row/colony counts and a positive refresh note.
+Large exports split sheets. Progress, OK/Open folder completion and error dialogs
+run on the Qt thread. Jobs stay paused until manually resumed. Master and
+Exported are ignored by dataset validation and revalidation. Implementation:
+ulb_scraper/municipality_export.py; tests/test_municipality_export.py.
+
+November 23 update: searchable selectors show checked/total active options,
+excluding ALL and headings, with counts retained while filtering. The existing
+output-folder note is red and bold. Export schema 8 separates Plot Area and Unit
+into adjacent columns and validates every mobile/phone column plus Mobile
+Numbers: retain ten digits, remove an optional Indian 91/+91 prefix, omit short,
+masked and other invalid lengths, then deduplicate. Raw checkpoint phone data
+is retained; missing-mobile updates classify older baselines through the same
+validation. Schema upgrades refresh exports without refetching properties.
+
 Windows HTTPS uses a shared explicit HTTPSHandler: native Windows certificate
 validation through truststore plus certifi public roots bundled by PyInstaller.
 Other platforms retain default system trust with the same supplementary roots.

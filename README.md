@@ -120,6 +120,11 @@ The redundant `Owner Names` column is omitted. If detailed owner names are
 absent, its map/page fallback is retained in `Owner 1: Name` without guessing
 how many owners a combined name represents.
 
+`State` follows `PID` and always contains `Haryana`. `Plot Area` contains the
+measurement only (for example, `2203.190`), followed immediately by `Plot Area
+Unit` (for example, `SqYard`). Each `Floor N: Covered Area` is followed by its
+`Floor N: Covered Area Unit`. Decimal precision is retained.
+
 Construction rows retain floor, occupancy, area and useful additional fields.
 `Floor N: Occupier Name` combines name and relationship without an ownership
 share. The row index preserves separate occupiers on the same floor. Neither
@@ -134,8 +139,10 @@ as `Step1` and `Step 2` are excluded.
 
 Mobile columns retain their first occurrence in PID-linked, owner-index, then
 floor-index order. Later duplicate numbers become `-`; distinct numbers in
-the same cell remain. Formatting differences and an Indian +91 prefix are
-normalized for comparison, without guessing full values from masked numbers.
+the same cell remain. Exports retain ten-digit numbers only, removing spacing
+and an Indian `91` or `+91` country prefix. Short, masked and other invalid
+lengths are omitted, as are repeated-digit placeholders such as `0000000000`
+and `9999999999`. The same validation identifies missing-mobile update targets.
 `Mobile Numbers` retains the complete deduplicated union near the end of usable
 data, followed by `Data Fetched At (IST)` and remaining provenance metadata
 (`Data Notes`, photo sources and photo download status).
@@ -164,6 +171,26 @@ deletion keeps portable checkpoints and saved files. Keep the hidden
 `.ulb-dataset.json` and colony `.ulb-checkpoint.sqlite3` files when moving a
 dataset. Details and conflict handling are documented in
 [UPDATE_DATA_DESIGN.md](docs/UPDATE_DATA_DESIGN.md).
+
+Each municipality row has **Export Excel** and **Last exported**. Export pauses
+that municipality, waits for its current work to stop, then builds a workbook
+in `Master/`, for example `panchkula_20261123_153000_123456.xlsx`. Other
+municipalities continue scraping. Progress and a completion popup show the saved
+filename and property row count, with **OK** and **Open folder** buttons. Resume
+the municipality when ready. All saved properties collected so far are included;
+export again to include future updates.
+
+The workbook combines queued colonies and retained colony folders, including
+those removed from the queue. Duplicate PIDs appear once, using the latest
+successfully fetched record and retaining colony memberships. Existing photos
+are linked relative to `Master`; keep the workbook inside the output root so
+those links work. No photos are downloaded again. Larger datasets split across
+property sheets, with export time and totals on an **Export details** sheet.
+The next export rebuilds the workbook and replaces the previous managed export;
+save edited copies elsewhere. Close the previous workbook in Excel first.
+`Master` and `Exported` are excluded from dataset imports. If a municipality has
+queued colonies in multiple roots, select the root where its combined workbook
+will be saved; all known municipality roots are included.
 
 Available full mobile values are retained, including the existing parser's
 PID-linked hidden input and owner-data script sources. Aadhaar, PAN, family IDs

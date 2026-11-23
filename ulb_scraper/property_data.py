@@ -14,13 +14,13 @@ from bs4 import BeautifulSoup
 
 
 PARSERVERSION = 2
-EXPORTVERSION = 7
+EXPORTVERSION = 9
 IMPORTANT = [
-    'PID', 'Municipality', 'Colony', 'Old PID', 'Owner Names',
+    'PID', 'State', 'Municipality', 'Colony', 'Old PID', 'Owner Names',
     'Old Owner / Occupier Name', 'Ownership Type',
     'Have Any Court Case, Stay / Legal Proceeding',
     'Property Category', 'Property Type', 'Property Subtype',
-    'Plot / House Number', 'Plot Area', 'Address',
+    'Plot / House Number', 'Plot Area', 'Plot Area Unit', 'Address',
     'Mobile Number Linked With PID', 'Mobile Numbers',
     'Authorized Status', 'Property Availability',
 ]
@@ -43,7 +43,7 @@ OWNERLABELS = {
 }
 FLOORLABELS = {
     'srno': 'Serial Number', 'floor': 'Floor', 'occupancytype': 'Occupancy Type',
-    'coveredarea': 'Covered Area', 'rebate': 'Rebate',
+    'coveredarea': 'Covered Area', 'coveredareaunit': 'Covered Area Unit', 'rebate': 'Rebate',
     'occupiername': 'Occupier Name', 'occupiergender': 'Occupier Gender',
     'occupierguardianname': 'Occupier Guardian Name',
     'occupierrelationtype': 'Occupier Relation Type',
@@ -415,6 +415,7 @@ def normalizeProperty(raw, parsed=None, job=None):
                        ['MobileNo', 'Mobile Number linked with the PID', 'Mobile Number linked with PID'])
     row = {
         'PID': choose(['PID'], ['PID', 'PIDNDC']),
+        'State': 'Haryana',
         'Municipality': choose(['Municipality', 'McName'], ['McName'], job.get('municipalityName', '')),
         'Colony': choose(['Colony Name'], ['ColonyName'], job.get('colonyName', '')),
         'Old PID': choose(['Old PID'], ['OldPID']),
@@ -427,6 +428,7 @@ def normalizeProperty(raw, parsed=None, job=None):
         'Address': choose(['Address'], ['Address1', 'Address']),
         'Plot / House Number': choose(['Plot No. / House No', 'Plot Number', 'House Number'], ['PlotNo', 'HouseNo']),
         'Plot Area': choose(['Plot Area'], ['PlotSize']),
+        'Plot Area Unit': choose(['Plot Area Unit', 'Unit'], ['Unit']),
         'Mobile Number Linked With PID': textValue(detail.get('MobileNoFull') or pidMobile),
         'Authorized Status': choose(['Authorized Status', 'Authorised Status'], ['IsAuthorised']),
     }
@@ -437,9 +439,7 @@ def normalizeProperty(raw, parsed=None, job=None):
         row['Plot / House Number Source'] = 'Address (inferred)' if row['Plot / House Number'] else ''
     else:
         row['Plot / House Number Source'] = 'Explicit field'
-    if not usable(page.get('plotarea')) and usable(raw.get('Unit')) and usable(row['Plot Area']):
-        row['Plot Area'] = f'{row["Plot Area"]} {raw["Unit"]}'
-    usedMap.add('unit')
+    row['Plot Area'], row['Plot Area Unit'] = splitPlotArea(row['Plot Area'], row['Plot Area Unit'])
     owners = detail.get('OwnerRows', []) if detail.get('ParseVersion', 1) >= 2 else legacyRows(detail.get('Tables', []), 'owner')
     if not owners:
         owners = [publicRow({key: value for key, value in owner.items()
@@ -501,8 +501,10 @@ def orderedColumns(available, nonEmpty):
         match = re.match(r'^(Owner|Floor) (\d+): (.+)', label)
         prefix, index, field = match.groups()
         labels = list(dict.fromkeys((OWNERLABELS if prefix == 'Owner' else FLOORLABELS).values()))
+        baseField = field[:-5] if field.endswith(' Unit') else field
         return (0 if prefix == 'Owner' else 1, int(index),
-                labels.index(field) if field in labels else len(labels), natural(field))
+                labels.index(baseField) if baseField in labels else len(labels),
+                natural(baseField), int(field.endswith(' Unit')))
 
     available = {label for label in available if not workflowField(label)}
     metadata = {label for label in available if metadataColumn(label)}
@@ -567,12 +569,26 @@ def cleanCombinedPerson(value):
     return personDescription(person, share=share)
 
 
+def splitPlotArea(value, unit=''):
+    '''Separate a plot measurement from its unit without changing precision.'''
+    logging.debug('Separating plot area and unit')
+    area = textValue(value) if usable(value) else ''
+    unit = textValue(unit) if usable(unit) else ''
+    match = re.fullmatch(r'([+-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+))\s*([^\d]*)', area)
+    if match:
+        return match[1], match[2].strip() or unit
+    return area, unit
+
+
 def mobileIdentity(value):
-    '''Compare formatted contact numbers. Inputs: <value>. Output: canonical key.'''
-    digits = re.sub(r'\D', '', value)
-    if re.fullmatch(r'[+\d\s().-]+', value) and digits:
-        return digits[2:] if len(digits) == 12 and digits.startswith('91') else digits
-    return textValue(value).casefold()
+    '''Return ten digits, removing an Indian country code; reject unusable numbers.'''
+    value = textValue(value)
+    if not re.fullmatch(r'\+?[0-9\s().-]+', value):
+        return ''
+    digits = re.sub(r'[^0-9]', '', value)
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    return digits if len(digits) == 10 and len(set(digits)) > 1 else ''
 
 
 def compactExportRow(source, peopleCombined=False):
@@ -586,6 +602,16 @@ def compactExportRow(source, peopleCombined=False):
     '''
     logging.debug('Preparing compact export row')
     row = dict(source)
+    row['State'] = 'Haryana'
+    oldUnit = row.pop('Unit', '')
+    plotUnit = row.get('Plot Area Unit') if usable(row.get('Plot Area Unit')) else oldUnit
+    if 'Plot Area' in row:
+        row['Plot Area'], row['Plot Area Unit'] = splitPlotArea(row['Plot Area'], plotUnit)
+    elif usable(plotUnit):
+        row['Plot Area Unit'] = textValue(plotUnit)
+    for label in list(row):
+        if re.fullmatch(r'Floor \d+: .*\bArea', label):
+            row[label], row[label + ' Unit'] = splitPlotArea(row[label], row.get(label + ' Unit', ''))
     pidMobileAliases = {'mobilenumberlinkedwithpid', 'mobilenumberlinkedwiththepid', 'mobileno'}
     aliasNumbers = []
     for label in list(row):
@@ -649,17 +675,17 @@ def compactExportRow(source, peopleCombined=False):
         unique = []
         for number in re.split(r'[,;|]', textValue(row[column])):
             number = number.strip()
-            if usable(number):
-                key = mobileIdentity(number)
-                if key not in allNumbers:
-                    allNumbers[key] = number
-                    unique.append(number)
+            key = mobileIdentity(number)
+            if key and key not in allNumbers:
+                allNumbers[key] = key
+                unique.append(key)
         row[column] = ', '.join(unique)
     remainingNumbers = [source.get('Mobile Numbers', ''), *aliasNumbers]
     for number in re.split(r'[,;|]', joinValues(remainingNumbers)):
         number = number.strip()
-        if usable(number):
-            allNumbers.setdefault(mobileIdentity(number), number)
+        key = mobileIdentity(number)
+        if key:
+            allNumbers.setdefault(key, key)
     row['Mobile Numbers'] = ', '.join(allNumbers.values())
     return row
 

@@ -7,6 +7,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+# Third Party Imports
+from openpyxl import load_workbook
+
 from ulb_scraper.exporter import exportJob, formatFetchedAt, iterExportRows
 from ulb_scraper.property_data import compactColumns, compactExportRow, normalizeProperty, personDescription
 from ulb_scraper.store import Store
@@ -69,16 +72,115 @@ class CompactExportTests(unittest.TestCase):
                   'Floor 2: Occupier Mobile': '9000000003',
                   'Mobile Numbers': '9000000001, 9000000002, 9000000003, 9000000004'}
         row = compactExportRow(source)
-        self.assertEqual(row['Mobile Number Linked With PID'], '+91 90000 00001')
+        self.assertEqual(row['Mobile Number Linked With PID'], '9000000001')
         self.assertEqual(row['Owner 2: Mobile'], '9000000002')
         self.assertEqual(row['Owner 10: Mobile'], '')
         self.assertEqual(row['Floor 1: Occupier Mobile'], '9000000003')
         self.assertEqual(row['Floor 2: Occupier Mobile'], '')
-        self.assertEqual(row['Mobile Numbers'], '+91 90000 00001, 9000000002, 9000000003, 9000000004')
+        self.assertEqual(row['Mobile Numbers'], '9000000001, 9000000002, 9000000003, 9000000004')
         row['Data Fetched At (IST)'] = '-'
         row['Data Notes'] = 'metadata'
         columns = compactColumns(set(row), set(row))
         self.assertEqual(columns[-3:], ['Mobile Numbers', 'Data Fetched At (IST)', 'Data Notes'])
+
+    def testInvalidMobilesAreRemovedFromEveryContactColumn(self):
+        source = {'Mobile Number Linked With PID': '123456789',
+                  'Owner 1: Mobile': '+91 90000-00001; 919000000002; 9000000003',
+                  'Floor 1: Occupier Mobile': '9000000001, 00XXXXX001, 12345',
+                  'Extra Phone': '9000000004',
+                  'Mobile Numbers': '9000000003, 123456789012, +44 9000000005, -, NA'}
+        row = compactExportRow(source)
+        self.assertEqual(row['Mobile Number Linked With PID'], '')
+        self.assertEqual(row['Owner 1: Mobile'], '9000000001, 9000000002, 9000000003')
+        self.assertEqual(row['Floor 1: Occupier Mobile'], '')
+        self.assertEqual(row['Mobile Numbers'], '9000000001, 9000000002, 9000000003, 9000000004')
+        self.assertEqual(source['Mobile Number Linked With PID'], '123456789')
+        self.assertEqual(compactExportRow(row, peopleCombined=True), row)
+        # A ten-digit number starting with 91 is already a local number.
+        self.assertEqual(compactExportRow({'Mobile Numbers': '9100000001'})['Mobile Numbers'], '9100000001')
+
+    def testPlotAreaAndUnitAreSeparateForNewAndLegacyRows(self):
+        for source, expected in [({'Plot Area': '2203.190 SqYard'}, ('2203.190', 'SqYard')),
+                                 ({'Plot Area': '1,200.00 Sq. Ft.', 'Unit': 'SqYard'}, ('1,200.00', 'Sq. Ft.')),
+                                 ({'Plot Area': '100', 'Unit': 'SqYard'}, ('100', 'SqYard')),
+                                 ({'Plot Area': '-'}, ('', ''))]:
+            with self.subTest(source=source):
+                row = compactExportRow(source)
+                self.assertEqual((row['Plot Area'], row['Plot Area Unit']), expected)
+                self.assertNotIn('Unit', row)
+                columns = compactColumns(set(row), set(row))
+                self.assertEqual(columns[columns.index('Plot Area') + 1], 'Plot Area Unit')
+        row = normalizeProperty({'PlotSize': '100.000', 'Unit': 'SqYard'},
+                                {'Detail': {'Fields': {'Plot Area': '2203.190 SqMeter'}}})
+        self.assertEqual((row['Plot Area'], row['Plot Area Unit']), ('2203.190', 'SqMeter'))
+
+    def testRepeatedDigitMobilesAreRejectedAfterRemovingCountryCode(self):
+        for digit in '0123456789':
+            for prefix in ('', '91', '+91 '):
+                with self.subTest(digit=digit, prefix=prefix):
+                    value = prefix + digit * 10
+                    row = compactExportRow({'Mobile Number Linked With PID': value,
+                                            'Owner 1: Mobile': value, 'Floor 1: Occupier Mobile': value,
+                                            'Mobile Numbers': value})
+                    for label in ('Mobile Number Linked With PID', 'Owner 1: Mobile',
+                                  'Floor 1: Occupier Mobile', 'Mobile Numbers'):
+                        self.assertEqual(row[label], '')
+        row = compactExportRow({'Mobile Numbers': '9999999999, 9999999998'})
+        self.assertEqual(row['Mobile Numbers'], '9999999998')
+
+    def testStateAndEveryFloorAreaUnitAreOrderedAndPreservePrecision(self):
+        source = {'PID': 'A', 'State': 'Old value', 'Municipality': 'Town',
+                  'Floor 12: Covered Area': '100.500 Sq.Ft',
+                  'Floor 3: Covered Area': '2203.190 SqYard',
+                  'Floor 3: Covered Area Unit': 'SqMeter',
+                  'Floor 3: Carpet Area': '90.000', 'Floor 3: Carpet Area Unit': 'Sq.Ft'}
+        row = compactExportRow(source)
+        self.assertEqual(row['State'], 'Haryana')
+        for label, area, unit in [('Floor 12: Covered Area', '100.500', 'Sq.Ft'),
+                                  ('Floor 3: Covered Area', '2203.190', 'SqYard'),
+                                  ('Floor 3: Carpet Area', '90.000', 'Sq.Ft')]:
+            self.assertEqual(row[label], area)
+            self.assertEqual(row[label + ' Unit'], unit)
+            columns = compactColumns(set(row), set(row))
+            self.assertEqual(columns[columns.index(label) + 1], label + ' Unit')
+        self.assertEqual(columns[:3], ['PID', 'State', 'Municipality'])
+        self.assertEqual(compactExportRow(row, peopleCombined=True), row)
+        self.assertEqual(source['Floor 12: Covered Area'], '100.500 Sq.Ft')
+
+    def testWorkbookPublishesSeparateAreaAndValidatedPhones(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            store = Store(home / 'state.sqlite3')
+            jobId = store.addJobs([({'id': '1', 'name': 'Town'}, {'id': '2', 'name': 'Colony'})], home / 'output')[0]
+            store.initializeTiles(jobId, 'unused', [(76, 30, 77, 31)])
+            store.saveTile(jobId, store.pendingTile(jobId), [
+                {'PID': 'A', 'pkPropertyId': 'A', 'PlotSize': '2203.190',
+                 'Unit': 'SqYard', 'MobileNo': '+91 90000 00001'},
+                {'PID': 'B', 'pkPropertyId': 'B', 'MobileNo': '123456789'}], lambda raw: [])
+            with store.connect() as connection:
+                identities = [record['identity'] for record in connection.execute('SELECT identity FROM properties')]
+            for identity in identities:
+                store.saveDetail(jobId, identity, {'Detail': {'FetchStatus': 'ok',
+                    'ConstructionRows': [{'Covered Area': '100.500 Sq.Ft'}]}}, [])
+                store.finishProperty(jobId, identity)
+            workbookPath = exportJob(store, store.job(jobId))
+            workbook = load_workbook(workbookPath, read_only=True)
+            try:
+                records = iter(workbook.active.values)
+                columns = next(records)
+                rows = {row['PID']: row for values in records if (row := dict(zip(columns, values)))}
+                self.assertEqual(columns[:4], ('PID', 'State', 'Municipality', 'Colony'))
+                self.assertEqual(rows['A']['State'], 'Haryana')
+                self.assertEqual(columns[columns.index('Plot Area') + 1], 'Plot Area Unit')
+                self.assertEqual(rows['A']['Plot Area'], '2203.190')
+                self.assertEqual(rows['A']['Plot Area Unit'], 'SqYard')
+                self.assertEqual(rows['A']['Mobile Numbers'], '9000000001')
+                self.assertEqual(rows['B']['Mobile Numbers'], '-')
+                self.assertEqual(rows['A']['Floor 1: Covered Area'], '100.500')
+                self.assertEqual(rows['A']['Floor 1: Covered Area Unit'], 'Sq.Ft')
+                self.assertEqual(columns[columns.index('Floor 1: Covered Area') + 1], 'Floor 1: Covered Area Unit')
+            finally:
+                workbook.close()
 
     def testFetchTimePersistsAndExportDoesNotAdvanceIt(self):
         with tempfile.TemporaryDirectory() as temporary:
