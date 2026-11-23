@@ -124,8 +124,19 @@ how many owners a combined name represents.
 measurement only (for example, `2203.190`), followed immediately by `Plot Area
 Unit` (for example, `SqYard`). Each `Floor N: Covered Area` is followed by its
 `Floor N: Covered Area Unit`. Decimal precision is retained.
+`Authority Area` and `Authority Area Unit` sit immediately before `Latitude`
+and `Longitude`. Units are separated when supplied; missing units remain `-`.
 
-Construction rows retain floor, occupancy, area and useful additional fields.
+Portal spelling/casing variants such as `Property Categeory` and `COVERED AREA
+(Sq. Feet)` are merged into the existing category and floor-area columns,
+retaining populated values and extracting header units. Redundant `Plot Size`
+fields feed `Plot Area`. Owner country, floor shop counts, identification proof,
+owner/property document-table fields, electricity account, landmark, pincode,
+street-name fields and the duplicate Hindi plot-number header are omitted from
+exports. Existing checkpoints use these rules when exports are regenerated.
+
+Construction rows retain the approved floor, occupancy, area, classification
+and usage fields.
 `Floor N: Occupier Name` combines name and relationship without an ownership
 share. The row index preserves separate occupiers on the same floor. Neither
 owners nor floors have a fixed business count limit.
@@ -134,8 +145,14 @@ The requested tax/dues columns, portal IDs/counters, redundant relationship
 fields, owner status/serial/GST/nodal fields, floor serial/rebate fields, and
 other explicitly excluded fields are omitted from CSV and Excel. The backend
 retains checkpoint data, processing states and errors for recovery and the UI.
-Unfamiliar useful fields and photo hyperlinks remain. Navigation artifacts such
-as `Step1` and `Step 2` are excluded.
+Export field types are fixed: unfamiliar portal fields cannot create new columns.
+Existing name formatting, mobile validation and area/unit conversion run before
+the final filter. Additional owners, floors and photos still expand into numbered
+columns without a fixed count limit, using only approved fields. Backend source
+data is retained. The schema is defined by `EXPORTFIELDS`, `OWNEREXPORTFIELDS`
+and `FLOOREXPORTFIELDS` in `ulb_scraper/property_data.py`. Colony, mobile-update
+and municipality exports all use it. Navigation artifacts such as `Step1` and
+`Step 2` are excluded.
 
 Mobile columns retain their first occurrence in PID-linked, owner-index, then
 floor-index order. Later duplicate numbers become `-`; distinct numbers in

@@ -11,11 +11,138 @@ import unittest
 from openpyxl import load_workbook
 
 from ulb_scraper.exporter import exportJob, formatFetchedAt, iterExportRows
-from ulb_scraper.property_data import compactColumns, compactExportRow, normalizeProperty, personDescription
+from ulb_scraper.property_data import (compactColumns, compactExportRow, normalizeProperty,
+                                     parsePropertyPage, personDescription, publicRow)
 from ulb_scraper.store import Store
 
 
 class CompactExportTests(unittest.TestCase):
+    def testFrozenColumnsKeepDynamicPeopleAreasAndPhotosWithoutUnknownFields(self):
+        source = {'PID': 'A', 'Owner 101: Name': 'PERSON', 'Owner 101: Gender': 'Female',
+                  'Owner 101: Relation': 'Husband', 'Owner 101: Father / Husband Name': 'PARTNER',
+                  'Owner 101: Share': '1/2', 'Owner 101: Mobile': '+91 90000 00001',
+                  'Floor 107: Covered Area': '2203.190 SqYard',
+                  'Floor 107: Occupier Name': 'TENANT', 'Floor 107: Occupier Gender': 'Male',
+                  'Floor 107: Occupier Guardian Name': 'PARENT', 'Floor 107: Occupier Relation Type': 'Father',
+                  'Floor 107: Property SubType': 'Independent House',
+                  'Photo 150': 'photos/old.jpg', 'Application no': 'APP-1',
+                  'Data Fetched At (UTC)': '2026-11-23T12:00:00+00:00',
+                  'New Portal Field': 'unrequested', 'Owner 201: Unexpected Field': 'unrequested',
+                  'Floor 301: Unexpected Area': '100 SqYard', 'New Metadata': 'unrequested'}
+        row = compactExportRow(source)
+        self.assertEqual(row['Owner 101: Name'], 'Mrs. PERSON W/O PARTNER (1/2)')
+        self.assertEqual(row['Owner 101: Mobile'], '9000000001')
+        self.assertEqual(row['Floor 107: Occupier Name'], 'Mr. TENANT S/O PARENT')
+        self.assertEqual(row['Floor 107: Covered Area'], '2203.190')
+        self.assertEqual(row['Floor 107: Covered Area Unit'], 'SqYard')
+        self.assertEqual(row['Floor 107: Property Subtype'], 'Independent House')
+        self.assertEqual(row['Photo 150'], 'photos/old.jpg')
+        self.assertEqual(row['Application No'], 'APP-1')
+        self.assertEqual(row['Data Fetched At (IST)'], '2026-11-23T17:30:00+05:30')
+        for label in ('New Portal Field', 'Owner 201: Unexpected Field', 'Owner 201: Name',
+                      'Floor 301: Unexpected Area', 'Floor 301: Unexpected Area Unit',
+                      'Floor 301: Occupier Name', 'New Metadata', 'Data Fetched At (UTC)'):
+            self.assertNotIn(label, row)
+        self.assertEqual(source['New Portal Field'], 'unrequested')
+        columns = compactColumns(set(row) | {'New Portal Field', 'Owner 201: Unexpected Field'}, set(row))
+        self.assertEqual(set(columns), set(row))
+        self.assertEqual(columns[columns.index('Floor 107: Covered Area') + 1], 'Floor 107: Covered Area Unit')
+        self.assertEqual(compactExportRow(row, peopleCombined=True), row)
+
+    def testAuthorityAreaAndUnitImmediatelyPrecedeCoordinates(self):
+        for authority, expected in [('2203.190 SqYard', ('2203.190', 'SqYard')),
+                                    ('2203.190', ('2203.190', '')),
+                                    ('-', ('', ''))]:
+            with self.subTest(authority=authority):
+                row = compactExportRow({'PID': 'A', 'AuthorityArea': authority,
+                                        'Latitude': '30.123', 'Longitude': '76.123',
+                                        'Extra Field': 'retained', 'Photos': 'photos/test.jpg'})
+                self.assertEqual((row['Authority Area'], row['Authority Area Unit']), expected)
+                self.assertNotIn('AuthorityArea', row)
+                columns = compactColumns(set(row), set(row))
+                start = columns.index('Authority Area')
+                self.assertEqual(columns[start:start + 4],
+                                 ['Authority Area', 'Authority Area Unit', 'Latitude', 'Longitude'])
+                self.assertEqual(compactExportRow(row, peopleCombined=True), row)
+        row = compactExportRow({'Authority Area': '100.500', 'Authority Area Unit': 'Sq.Ft'})
+        self.assertEqual((row['Authority Area'], row['Authority Area Unit']), ('100.500', 'Sq.Ft'))
+    def testRequestedFormAndDocumentFieldsAreExcludedAtEveryIndex(self):
+        source = {'Identification Proof': 'Unwanted', 'Plot Area': '100', 'Plot Size': '',
+                  'Property Category': '', 'Property Categeory': 'Residential',
+                  'Electricity Consumer A/c No': 'Unwanted', 'Electricity Consumer ACNo': 'Unwanted',
+                  'Landmark': 'Unwanted', 'Pincode': 'Unwanted', 'Street No Name': 'Unwanted',
+                  'Street No./ Name': 'Unwanted', '(प्लॉट नंबर/मकान नंबर)': 'H-3',
+                  'Useful Extra': 'Keep', 'Photos': 'photos/test.jpg'}
+        for index in (1, 2, 3, 12):
+            source.update({f'Owner {index}: Country Name': 'India', f'Floor {index}: NO.Of Shops': '2',
+                           f'Floor {index}: Covered Area': '',
+                           f'Floor {index}: COVERED AREA (Sq. Feet)': '100.500',
+                           f'Floor {index}: Property Category': '',
+                           f'Floor {index}: Property Categeory': '',
+                           f'Floor {index}: Property Categeory 2': 'Residential'})
+        for table in ('Owner Details', 'Property Details'):
+            for index in range(1, 16):
+                for field in ('Document', 'Document Type', 'Sr.No', 'View File'):
+                    source[f'{table} 1, Row {index}: {field}'] = 'Unwanted'
+        row = compactExportRow(source)
+        self.assertEqual(row['Property Category'], 'Residential')
+        self.assertEqual(row['Plot / House Number'], 'H-3')
+        self.assertEqual(row['Plot Area'], '100')
+        self.assertNotIn('Useful Extra', row)
+        self.assertEqual(row['Photos'], 'photos/test.jpg')
+        self.assertFalse(any(value == 'Unwanted' for value in row.values()))
+        for index in (1, 2, 3, 12):
+            self.assertEqual(row[f'Floor {index}: Covered Area'], '100.500')
+            self.assertEqual(row[f'Floor {index}: Covered Area Unit'], 'Sq. Feet')
+            self.assertEqual(row[f'Floor {index}: Property Category'], 'Residential')
+            self.assertNotIn(f'Floor {index}: Property Categeory 2', row)
+            self.assertNotIn(f'Floor {index}: COVERED AREA (Sq. Feet)', row)
+            self.assertNotIn(f'Floor {index}: NO.Of Shops', row)
+            self.assertNotIn(f'Owner {index}: Country Name', row)
+        for removed in ('Identification Proof', 'Plot Size', 'Property Categeory',
+                        'Electricity Consumer A/c No', 'Electricity Consumer ACNo', 'Landmark', 'Pincode',
+                        'Street No Name', 'Street No./ Name', '(प्लॉट नंबर/मकान नंबर)'):
+            self.assertNotIn(removed, row)
+        self.assertFalse(any(label.startswith(('Owner Details', 'Property Details')) for label in row))
+        self.assertEqual(source['Floor 1: Covered Area'], '')
+        self.assertEqual(compactExportRow(row, peopleCombined=True), row)
+
+    def testAliasesFillEmptyValuesAndPreservePopulatedCanonicalValues(self):
+        row = compactExportRow({'Property Category': 'Residential', 'Property Categeory': '',
+                                'Plot Area': '', 'Plot Size': '2203.190 SqYard',
+                                'Floor 1: Covered Area': '100', 'Floor 1: Covered Area Unit': 'SqYard',
+                                'Floor 1: COVERED AREA (Sq. Feet)': '',
+                                'Floor 1: Property Category': 'Commercial',
+                                'Floor 1: Property Categeory': 'Residential'})
+        self.assertEqual(row['Property Category'], 'Residential')
+        self.assertEqual(row['Plot Area'], '2203.190')
+        self.assertEqual(row['Plot Area Unit'], 'SqYard')
+        self.assertEqual(row['Floor 1: Covered Area Unit'], 'SqYard')
+        self.assertEqual(row['Floor 1: Property Category'], 'Commercial')
+        parsed = {'Detail': {'PropertyCategory': 'Residential',
+                             'Fields': {'Property Category': '', 'PROPERTY CATEGORY': ''}}}
+        self.assertEqual(normalizeProperty({}, parsed)['Property Category'], 'Residential')
+        self.assertEqual(publicRow({'Covered Area': '100', 'COVERED AREA': ''},
+                                   {'coveredarea': 'Covered Area'}), {'Covered Area': '100'})
+
+    def testPortalHtmlDuplicateHeadersBecomeOnePopulatedFloorField(self):
+        html = '''<dl><dt>Property Categeory</dt><dd>Residential</dd>
+            <dt>Plot Size</dt><dd>2203.190 SqYard</dd></dl>
+            <table><thead><tr><th>Floor</th><th>Covered Area</th>
+            <th>COVERED AREA (Sq. Feet)</th><th>Property Categeory</th>
+            <th>Property Categeory</th><th>NO.Of Shops</th></tr></thead>
+            <tbody><tr><td>Ground</td><td></td><td>100.500</td><td></td>
+            <td>Commercial</td><td>2</td></tr></tbody></table>
+            <h4>Owner Details</h4><table><tr><th>Document</th><th>View File</th></tr>
+            <tr><td>Unwanted document</td><td>Unwanted file</td></tr></table>'''
+        row = compactExportRow(normalizeProperty({'PID': 'A'}, parsePropertyPage(html)))
+        self.assertEqual(row['Property Category'], 'Residential')
+        self.assertEqual(row['Plot Area'], '2203.190')
+        self.assertEqual(row['Floor 1: Property Category'], 'Commercial')
+        self.assertEqual(row['Floor 1: Covered Area'], '100.500')
+        self.assertEqual(row['Floor 1: Covered Area Unit'], 'Sq. Feet')
+        self.assertFalse(any('Categeory' in label or 'Document' in label for label in row))
+
     def testRelationshipsHavePrefixesAndMissingValuesAreOmitted(self):
         for gender, relation, abbreviation in [('Female', 'Husband', 'W/O'),
                                                ('Male', 'Wife', 'H/O'),
@@ -50,7 +177,8 @@ class CompactExportTests(unittest.TestCase):
         self.assertEqual(row['Owner 12: Name'], 'Mrs. Person W/O Partner (1/2)')
         self.assertEqual(row['Floor 15: Occupier Name'], 'Mr. Tenant S/O Parent')
         self.assertEqual(row['Floor 15: Covered Area'], '100')
-        self.assertEqual(row['Unfamiliar Useful Field'], 'retained')
+        self.assertNotIn('Unfamiliar Useful Field', row)
+        self.assertEqual(source['Unfamiliar Useful Field'], 'retained')
         for deleted in ('Owner Names', 'Owner 12: Share', 'Owner 12: Gender', 'Owner 12: GST Number',
                         'Owner 12: Authenticated Status', 'Floor 15: Occupier Guardian Name',
                         'Floor 15: Rebate', 'Processing Status', 'Processing Error',
@@ -155,7 +283,8 @@ class CompactExportTests(unittest.TestCase):
             store.initializeTiles(jobId, 'unused', [(76, 30, 77, 31)])
             store.saveTile(jobId, store.pendingTile(jobId), [
                 {'PID': 'A', 'pkPropertyId': 'A', 'PlotSize': '2203.190',
-                 'Unit': 'SqYard', 'MobileNo': '+91 90000 00001'},
+                 'Unit': 'SqYard', 'MobileNo': '+91 90000 00001',
+                 'AuthorityArea': '100.500 Sq.Ft', 'Lat': '30.123', 'Long': '76.123'},
                 {'PID': 'B', 'pkPropertyId': 'B', 'MobileNo': '123456789'}], lambda raw: [])
             with store.connect() as connection:
                 identities = [record['identity'] for record in connection.execute('SELECT identity FROM properties')]
@@ -178,6 +307,11 @@ class CompactExportTests(unittest.TestCase):
                 self.assertEqual(rows['B']['Mobile Numbers'], '-')
                 self.assertEqual(rows['A']['Floor 1: Covered Area'], '100.500')
                 self.assertEqual(rows['A']['Floor 1: Covered Area Unit'], 'Sq.Ft')
+                start = columns.index('Authority Area')
+                self.assertEqual(columns[start:start + 4],
+                                 ('Authority Area', 'Authority Area Unit', 'Latitude', 'Longitude'))
+                self.assertEqual(rows['A']['Authority Area'], '100.500')
+                self.assertEqual(rows['A']['Authority Area Unit'], 'Sq.Ft')
                 self.assertEqual(columns[columns.index('Floor 1: Covered Area') + 1], 'Floor 1: Covered Area Unit')
             finally:
                 workbook.close()

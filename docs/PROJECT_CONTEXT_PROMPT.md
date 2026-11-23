@@ -2,6 +2,35 @@
 
 Context snapshot: 20 November 2026.
 
+November 24: export schema 12 replaces the unknown-column export fallback with
+explicit EXPORTFIELDS, OWNEREXPORTFIELDS and FLOOREXPORTFIELDS allowlists. Raw
+normalization/checkpoints can retain unfamiliar fields, but compactExportRow and
+compactColumns block their export. Apply aliases, combined-person descriptions,
+area splits and mobile rules before filtering. Approved owner/floor/photo groups
+remain unlimited in number. Unknown repeated fields alone cannot create blank
+owner/occupier groups. Existing floor subtype and application-number aliases are
+canonicalized. Legacy UTC fetch times convert to IST before the filter; the
+shared formatFetchedAt remains importable from exporter for compatibility. This
+supersedes older notes about preserving unknown fields in user-facing exports.
+
+November 24: export schema 11 places Authority Area, Authority Area Unit,
+Latitude and Longitude together in that order. Authority-area units come from
+the provided value or explicit unit field; missing units are not inferred from
+plot/floor units. Alias cleanup and ordering apply to retained and master exports.
+
+Export schema 10 reconciles property-category spelling/casing/numbered header
+aliases (including Property Categeory), redundant Plot Size, floor covered-area
+headers with embedded units, and the Hindi plot-number alias. Populated canonical
+values win; aliases fill gaps and disappear. Page/table normalization prevents
+empty equivalent labels from overwriting populated values. Explicit export
+exclusions now cover every owner's Country Name, every floor's NO.Of Shops,
+Identification Proof, Owner Details/Property Details document-table columns at
+all row indices, electricity-account variants, Landmark, Pincode and street-name
+variants. This refines the intentional unknown-field fallback rather than adding
+a fixed-column whitelist: other useful unknown fields remain. Live/retained colony
+and municipality exports share the cleanup; checkpoints are retained and no
+network refresh is needed to regenerate the corrected workbook presentation.
+
 Export schema 9 adds constant State=Haryana immediately after PID, renames Unit
 to Plot Area Unit (while consuming legacy Unit fields), and splits every floor
 area and its adjacent unit column without losing decimal precision. Mobile
@@ -162,8 +191,8 @@ of normal processing, not optional enrichment in the desktop application.
 - Restrict production map collection to the selected colony polygon, including
   its boundary. Do not return to an unbounded frontier scan.
 - Export readable, consolidated columns, not duplicate `Detail.xyz` fields.
-- Keep unknown useful fields and variable owner/floor records rather than
-  silently discarding them to fit a small static schema.
+- Retain source checkpoint data, but export only the approved field types.
+  Owner/floor/photo counts remain dynamic without permitting new field types.
 - Existing user data, manual pause decisions, cookies, folders, and checkpoints
   must not be erased or reset without explicit authorization.
 - Keep operational metadata at the end of exports, after actual property data.

@@ -2,7 +2,6 @@
 
 # Standard Library Imports
 import csv
-from datetime import datetime, timedelta, timezone
 import json
 import logging
 import shutil
@@ -17,22 +16,7 @@ from openpyxl.utils import get_column_letter
 
 from scraper import isZeroLike, normalizeCellValue
 from ulb_scraper import datasets
-from ulb_scraper.property_data import compactColumns, compactExportRow, normalizeProperty
-
-
-def formatFetchedAt(value):
-    '''Format a recorded instant in IST. Inputs: <value>. Output: ISO timestamp or -.'''
-    logging.debug('Formatting property fetch time in IST')
-    if not value or str(value).strip() == '-':
-        return '-'
-    try:
-        timestamp = datetime.fromisoformat(value)
-        if timestamp.tzinfo is None:
-            raise ValueError('Fetch time has no timezone')
-    except (TypeError, ValueError):
-        logging.warning('Invalid property fetch timestamp; leaving exported time empty')
-        return '-'
-    return timestamp.astimezone(timezone(timedelta(hours=5, minutes=30), 'IST')).isoformat(timespec='seconds')
+from ulb_scraper.property_data import compactColumns, compactExportRow, formatFetchedAt, normalizeProperty
 
 
 def iterExportRows(connection, jobId, job=None, mobileReport=False):

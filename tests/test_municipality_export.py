@@ -98,6 +98,36 @@ class MunicipalityExportTests(unittest.TestCase):
         unusedWorkbook, rows = self.readWorkbook(exportMunicipality(self.store, self.queued(), self.root))
         self.assertEqual(rows['DUP']['Address'], 'Good address')
 
+    def testLegacyExtraHeadersAreCleanedInMunicipalityWorkbook(self):
+        folder = self.root / 'panchkula_60' / 'legacy_3'
+        folder.mkdir(parents=True)
+        row = {'PID': 'A', 'Property Category': '', 'Property Categeory': 'Residential',
+               'Plot Area': '', 'Plot Size': '100.500 SqYard',
+               'Floor 3: Covered Area': '', 'Floor 3: COVERED AREA (Sq. Feet)': '90.000',
+               'Floor 3: NO.Of Shops': '2', 'Owner 2: Country Name': 'India',
+               'Property Details 1, Row 10: View File': 'Unwanted',
+               'A New Portal Field': 'Do not export',
+               'Owner 24: Name': 'PERSON', 'Owner 24: Gender': 'Female',
+               'Owner 24: Relation': 'Husband', 'Owner 24: Father / Husband Name': 'PARTNER',
+               'Floor 36: Covered Area': '100.500 Sq.Ft'}
+        with (folder / 'properties.csv').open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        workbook, rows = self.readWorkbook(exportMunicipality(self.store, self.queued(), self.root))
+        self.assertEqual(rows['A']['Property Category'], 'Residential')
+        self.assertEqual(rows['A']['Plot Area'], '100.500')
+        self.assertEqual(rows['A']['Floor 3: Covered Area Unit'], 'Sq. Feet')
+        self.assertNotIn('Property Categeory', rows['A'])
+        self.assertNotIn('Plot Size', rows['A'])
+        self.assertNotIn('Floor 3: NO.Of Shops', rows['A'])
+        self.assertNotIn('Owner 2: Country Name', rows['A'])
+        self.assertNotIn('Property Details 1, Row 10: View File', rows['A'])
+        self.assertNotIn('A New Portal Field', rows['A'])
+        self.assertEqual(rows['A']['Owner 24: Name'], 'Mrs. PERSON W/O PARTNER')
+        self.assertEqual(rows['A']['Floor 36: Covered Area'], '100.500')
+        self.assertEqual(rows['A']['Floor 36: Covered Area Unit'], 'Sq.Ft')
+
     def testEmptyMunicipalityProducesAValidWorkbookAndZeroRows(self):
         result = exportMunicipality(self.store, self.queued(), self.root)
         workbook, rows = self.readWorkbook(result)

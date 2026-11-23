@@ -2,6 +2,7 @@
 
 # Standard Library Imports
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import hashlib
 from html import unescape
 import json
@@ -14,7 +15,27 @@ from bs4 import BeautifulSoup
 
 
 PARSERVERSION = 2
-EXPORTVERSION = 9
+EXPORTVERSION = 12
+# Freeze column types, while allowing additional owners, floors and photos.
+EXPORTFIELDS = frozenset({
+    'PID', 'State', 'Municipality', 'Colony', 'Old PID',
+    'Old Owner / Occupier Name', 'Ownership Type',
+    'Have Any Court Case, Stay / Legal Proceeding',
+    'Property Category', 'Property Type', 'Property Subtype',
+    'Plot / House Number', 'Plot Area', 'Plot Area Unit', 'Address',
+    'Mobile Number Linked With PID', 'Mobile Numbers',
+    'Application No', 'Application Raised From Mobile Number', 'Khasra Number',
+    'Authority Area', 'Authority Area Unit', 'Latitude', 'Longitude',
+    'Photos', 'Photo Source URLs', 'Photo Download Status', 'Data Notes',
+    'Data Fetched At (IST)', 'Data Last Checked At (IST)',
+    'Data Last Changed At (IST)', 'Update Review',
+})
+OWNEREXPORTFIELDS = frozenset({'Name', 'Mobile', 'Authorized Representative Name'})
+FLOOREXPORTFIELDS = frozenset({
+    'Floor', 'Occupancy Type', 'Covered Area', 'Covered Area Unit',
+    'Carpet Area', 'Carpet Area Unit', 'Property Category', 'Property Type',
+    'Property Subtype', 'Property Usage', 'Occupier Name', 'Occupier Mobile',
+})
 IMPORTANT = [
     'PID', 'State', 'Municipality', 'Colony', 'Old PID', 'Owner Names',
     'Old Owner / Occupier Name', 'Ownership Type',
@@ -189,8 +210,9 @@ def publicRow(row, labels):
         if privateLabel(label) or workflowField(label) or key.startswith('update'):
             continue
         name = labels.get(key, textValue(label))
-        result[name] = (authenticationStatus(value) if key == 'authenticatedstatus' else
-                        textValue(value) if 'mobile' in key or 'phone' in key else textValue(value))
+        value = authenticationStatus(value) if key == 'authenticatedstatus' else textValue(value)
+        if usable(value) or name not in result:
+            result[name] = value
     return result
 
 
@@ -393,9 +415,16 @@ def normalizeProperty(raw, parsed=None, job=None):
     detail = (parsed or {}).get('Detail', {})
     job = job or {}
     fields = detail.get('Fields', {})
-    page = {labelKey(label): value for label, value in detail.items() if not isinstance(value, (dict, list))}
-    page.update({labelKey(label): value for label, value in fields.items()})
-    mapping = {labelKey(label): value for label, value in raw.items()}
+    page = {}
+    for label, value in [*detail.items(), *fields.items()]:
+        key = labelKey(label)
+        if not isinstance(value, (dict, list)) and (usable(value) or key not in page):
+            page[key] = value
+    mapping = {}
+    for label, value in raw.items():
+        key = labelKey(label)
+        if usable(value) or key not in mapping:
+            mapping[key] = value
     usedPage = set()
     usedMap = set()
     notes = []
@@ -422,12 +451,13 @@ def normalizeProperty(raw, parsed=None, job=None):
         'Old Owner / Occupier Name': choose(['Old Owner / Occupier Name'], ['OwnerNameNDC']),
         'Ownership Type': choose(['Ownership Type'], ['OwnershipType']),
         'Have Any Court Case, Stay / Legal Proceeding': choose(['Have Any Court Case, Stay/Legal Proceeding'], ['HaveAnyCourtCaseStayLegalProceeding']),
-        'Property Category': choose(['Property Category'], ['PropertyCategory'], name='Property Category'),
+        'Property Category': choose(['Property Category', 'Property Categeory'],
+                                    ['PropertyCategory', 'PropertyCategeory'], name='Property Category'),
         'Property Type': choose(['Property Type'], ['PropertyType'], name='Property Type'),
         'Property Subtype': choose(['Property SubType'], ['PropertySubType'], name='Property Subtype'),
         'Address': choose(['Address'], ['Address1', 'Address']),
         'Plot / House Number': choose(['Plot No. / House No', 'Plot Number', 'House Number'], ['PlotNo', 'HouseNo']),
-        'Plot Area': choose(['Plot Area'], ['PlotSize']),
+        'Plot Area': choose(['Plot Area', 'Plot Size'], ['PlotSize']),
         'Plot Area Unit': choose(['Plot Area Unit', 'Unit'], ['Unit']),
         'Mobile Number Linked With PID': textValue(detail.get('MobileNoFull') or pidMobile),
         'Authorized Status': choose(['Authorized Status', 'Authorised Status'], ['IsAuthorised']),
@@ -591,6 +621,95 @@ def mobileIdentity(value):
     return digits if len(digits) == 10 and len(set(digits)) > 1 else ''
 
 
+def formatFetchedAt(value):
+    '''Format a recorded instant in IST. Inputs: <value>. Output: ISO timestamp or -.'''
+    logging.debug('Formatting property fetch time in IST')
+    if not value or str(value).strip() == '-':
+        return '-'
+    try:
+        timestamp = datetime.fromisoformat(value)
+        if timestamp.tzinfo is None:
+            raise ValueError('Fetch time has no timezone')
+    except (TypeError, ValueError):
+        logging.warning('Invalid property fetch timestamp; leaving exported time empty')
+        return '-'
+    return timestamp.astimezone(timezone(timedelta(hours=5, minutes=30), 'IST')).isoformat(timespec='seconds')
+
+
+def approvedExportField(label):
+    '''Allow fixed field types with unlimited numbered owner/floor/photo groups.'''
+    if label in EXPORTFIELDS or re.fullmatch(r'Photo [1-9]\d*', label):
+        return True
+    repeated = re.fullmatch(r'(Owner|Floor) [1-9]\d*: (.+)', label)
+    return bool(repeated and repeated[2] in (
+        OWNEREXPORTFIELDS if repeated[1] == 'Owner' else FLOOREXPORTFIELDS))
+
+
+def canonicalExportFields(source):
+    '''Merge equivalent portal headers while retaining populated canonical values.'''
+    logging.debug('Reconciling property export header aliases')
+    row = dict(source)
+    oldTimestamp = row.pop('Data Fetched At (UTC)', None)
+    if usable(oldTimestamp) and not usable(row.get('Data Fetched At (IST)')):
+        row['Data Fetched At (IST)'] = formatFetchedAt(oldTimestamp)
+    for label in list(row):
+        repeated = re.fullmatch(r'(Floor \d+):\s*(.+)', label)
+        prefix = repeated[1] + ': ' if repeated else ''
+        field = repeated[2] if repeated else label
+        key = re.sub(r'\d+$', '', labelKey(field))
+        canonical = None
+        unit = ''
+        if key in ('propertycategory', 'propertycategeory'):
+            canonical = prefix + 'Property Category'
+        elif not prefix and key == 'plotsize':
+            canonical = 'Plot Area'
+        elif not prefix and key in ('authorityarea', 'authorityareaunit'):
+            canonical = 'Authority Area Unit' if key.endswith('unit') else 'Authority Area'
+        elif not prefix and key == 'applicationno':
+            canonical = 'Application No'
+        elif prefix and key in ('propertytype', 'propertysubtype', 'propertyusage'):
+            canonical = prefix + {'propertytype': 'Property Type',
+                                  'propertysubtype': 'Property Subtype',
+                                  'propertyusage': 'Property Usage'}[key]
+        elif not prefix and re.sub(r'[\s()]', '', label) == 'प्लॉटनंबर/मकाननंबर':
+            canonical = 'Plot / House Number'
+        elif prefix:
+            # Older portal tables embed the unit in their covered-area header.
+            # Numbered suffixes are generated when HTML repeats a table header.
+            base = re.sub(r'\([^)]*\)', '', field)
+            baseKey = re.sub(r'\d+$', '', labelKey(base))
+            if baseKey == 'coveredarea':
+                canonical = prefix + 'Covered Area'
+                unitMatch = re.search(r'\(([^)]+)\)', field)
+                unit = unitMatch[1].strip() if unitMatch else ''
+            elif key == 'coveredareaunit':
+                canonical = prefix + 'Covered Area Unit'
+        if canonical:
+            if not usable(row.get(canonical)) and usable(row[label]):
+                row[canonical] = row[label]
+            if unit and not usable(row.get(prefix + 'Covered Area Unit')):
+                row[prefix + 'Covered Area Unit'] = unit
+            if label != canonical:
+                del row[label]
+    return row
+
+
+def excludedExportField(label):
+    '''Exclude the requested document, identity and supplementary form fields.'''
+    key = labelKey(label)
+    if key in {'identificationproof', 'electricityconsumeracno', 'landmark', 'pincode', 'streetnoname'}:
+        return True
+    if re.fullmatch(r'(?:owner|property)details\d+row\d+(?:document|documenttype|srno|viewfile)\d*', key):
+        return True
+    repeated = re.fullmatch(r'(Owner|Floor) \d+:\s*(.+)', label)
+    if repeated:
+        field = re.sub(r'\d+$', '', labelKey(repeated[2]))
+        return field == 'identificationproof' or (
+            repeated[1] == 'Owner' and field == 'countryname') or (
+            repeated[1] == 'Floor' and field in ('noofshops', 'numberofshops'))
+    return False
+
+
 def compactExportRow(source, peopleCombined=False):
     '''
     Project normalized checkpoint data into the compact user export schema.
@@ -601,7 +720,7 @@ def compactExportRow(source, peopleCombined=False):
     Output:    New row with combined people and deduplicated contact columns
     '''
     logging.debug('Preparing compact export row')
-    row = dict(source)
+    row = canonicalExportFields(source)
     row['State'] = 'Haryana'
     oldUnit = row.pop('Unit', '')
     plotUnit = row.get('Plot Area Unit') if usable(row.get('Plot Area Unit')) else oldUnit
@@ -609,6 +728,8 @@ def compactExportRow(source, peopleCombined=False):
         row['Plot Area'], row['Plot Area Unit'] = splitPlotArea(row['Plot Area'], plotUnit)
     elif usable(plotUnit):
         row['Plot Area Unit'] = textValue(plotUnit)
+    row['Authority Area'], row['Authority Area Unit'] = splitPlotArea(
+        row.get('Authority Area'), row.get('Authority Area Unit', ''))
     for label in list(row):
         if re.fullmatch(r'Floor \d+: .*\bArea', label):
             row[label], row[label + ' Unit'] = splitPlotArea(row[label], row.get(label + ' Unit', ''))
@@ -621,8 +742,9 @@ def compactExportRow(source, peopleCombined=False):
                 if not usable(row.get('Mobile Number Linked With PID')):
                     row['Mobile Number Linked With PID'] = row[label]
             del row[label]
-    ownerIndices = sorted({int(match.group(1)) for label in row
-                           if (match := re.match(r'^Owner (\d+):', label))})
+    ownerInputs = OWNEREXPORTFIELDS | {'Gender', 'Father / Husband Name', 'Relation', 'Share'}
+    ownerIndices = sorted({int(match[1]) for label in row
+                           if (match := re.fullmatch(r'Owner ([1-9]\d*): (.+)', label)) and match[2] in ownerInputs})
     if not any(usable(row.get(f'Owner {index}: Name')) for index in ownerIndices) and usable(row.get('Owner Names')):
         row['Owner 1: Name'] = row['Owner Names']
         ownerIndices = sorted(set(ownerIndices + [1]))
@@ -632,8 +754,9 @@ def compactExportRow(source, peopleCombined=False):
             row.get(prefix + 'Name'), row.get(prefix + 'Gender'),
             row.get(prefix + 'Father / Husband Name'), row.get(prefix + 'Relation'),
             share=row.get(prefix + 'Share', ''))
-    floorIndices = sorted({int(match.group(1)) for label in row
-                           if (match := re.match(r'^Floor (\d+):', label))})
+    floorInputs = FLOOREXPORTFIELDS | {'Occupier Gender', 'Occupier Guardian Name', 'Occupier Relation Type'}
+    floorIndices = sorted({int(match[1]) for label in row
+                           if (match := re.fullmatch(r'Floor ([1-9]\d*): (.+)', label)) and match[2] in floorInputs})
     for index in ([] if peopleCombined else floorIndices):
         prefix = f'Floor {index}: Occupier '
         row[prefix + 'Name'] = personDescription(
@@ -659,7 +782,7 @@ def compactExportRow(source, peopleCombined=False):
     floorFields = {'serialnumber', 'rebate', 'occupiergender', 'occupierguardianname', 'occupierrelationtype'}
     for label in list(row):
         repeated = re.match(r'^(Owner|Floor) \d+: (.+)$', label)
-        if (labelKey(label) in deletedKeys or privateLabel(label) or workflowField(label) or
+        if (labelKey(label) in deletedKeys or excludedExportField(label) or privateLabel(label) or workflowField(label) or
                 label.startswith(('Due Details:', 'OutStanding Dues Details')) or
                 repeated and labelKey(repeated.group(2)) in (ownerFields if repeated.group(1) == 'Owner' else floorFields)):
             del row[label]
@@ -687,13 +810,20 @@ def compactExportRow(source, peopleCombined=False):
         if key:
             allNumbers.setdefault(key, key)
     row['Mobile Numbers'] = ', '.join(allNumbers.values())
-    return row
+    return {label: value for label, value in row.items() if approvedExportField(label)}
 
 
 def compactColumns(available, nonEmpty):
     '''Order usable fields, contact summary, timestamp, then metadata. Inputs: <available>, <nonEmpty>. Output: list.'''
+    available = {label for label in available if approvedExportField(label)}
     columns = orderedColumns(available, nonEmpty)
     tail = ['Mobile Numbers', 'Data Fetched At (IST)', 'Data Last Checked At (IST)', 'Data Last Changed At (IST)']
     data = [label for label in columns if label not in tail and not metadataColumn(label)]
+    geographic = ['Authority Area', 'Authority Area Unit', 'Latitude', 'Longitude']
+    anchor = next((index for index, label in enumerate(data) if label in ('Latitude', 'Longitude')),
+                  next((index for index, label in enumerate(data) if label in geographic), len(data)))
+    position = sum(label not in geographic for label in data[:anchor])
+    data = [label for label in data if label not in geographic]
+    data[position:position] = [label for label in geographic if label in available]
     metadata = [label for label in columns if label not in tail and metadataColumn(label)]
     return data + [label for label in tail if label in available] + metadata
