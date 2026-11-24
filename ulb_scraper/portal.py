@@ -166,6 +166,22 @@ class PortalClient(PortalSession):
         fields['SourceUrl'] = BASEURL + url
         return detail
 
+    def lookupPid(self, municipalityId, pid):
+        '''Look up an exact PID without requiring a colony or map boundary.'''
+        logging.debug('Looking up an exact property ID')
+        data = {'pageNo': '1', 'pageSize': '10', 'efkUlbId': encryptPortalValue(municipalityId),
+                'PID': pid, 'OwnerName': '', 'MobileNo': '', 'fkColonySurveyId': '',
+                'fkPropertyCategoryId': '', 'wkt': '', 'searchType': '2', 'PIDNDC': '', 'PlotNo': ''}
+        rows = self.requestJson('GET', '/SearchProperty/getSearchPropertiesData?' + parse.urlencode(data),
+                                referer=f'{BASEURL}/SearchProperty/SearchPropertyOnMap')
+        if not isinstance(rows, list):
+            raise PortalResponseError('Unexpected PID lookup response')
+        exact = [row for row in rows if str(row.get('PID', '')).strip().upper() == pid.strip().upper()
+                 and str(row.get('fkULBId')) == str(municipalityId)]
+        if len(exact) != 1:
+            raise PortalResponseError('PID was not found uniquely in the selected municipality')
+        return exact[0]
+
     def downloadPhoto(self, url, folder, identity):
         '''
         Download a bounded image and atomically save it under a stable filename.

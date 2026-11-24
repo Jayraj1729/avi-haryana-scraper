@@ -2,6 +2,7 @@
 
 # Standard Library Imports
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -17,10 +18,12 @@ from urllib import parse
 from scraper import (AuthenticationError, BASEURL, buildRectWkt,
                      encryptPortalValue, PortalHttpError, PortalResponseError, propertyIdentity, slugify)
 from ulb_scraper import datasets
+from ulb_scraper.elapsed import ElapsedTracker
 from ulb_scraper.exporter import exportJob
 from ulb_scraper.geometry import containsProperty, readBoundary, seedBounds, splitBounds
 from ulb_scraper.municipality_export import exportMunicipality
 from ulb_scraper.portal import PortalClient, propertyPhotoUrls
+from ulb_scraper.pid_verification import municipalityKey, PidReference, queueProperty, recoveryJob
 from ulb_scraper.property_data import publicViewRestricted
 from ulb_scraper.traffic import TrafficController
 
@@ -87,6 +90,9 @@ class Engine(threading.Thread):
         self.publishedCounts = {}
         self.retainedExports = store.retainedExportJobs()
         self.municipalityExport = None
+        self.elapsed = ElapsedTracker(store)
+        self.pidReference = PidReference(home)
+        self.pidCancel = threading.Event()
 
     def submit(self, action, **payload):
         '''Queue a worker operation. Inputs: <action>, [payload]. Output: None.'''
@@ -120,7 +126,7 @@ class Engine(threading.Thread):
                     raise WorkSuspended('Application is closing')
                 if jobId:
                     job = self.store.job(jobId)
-                    if (not job or not job['desired'] or not self.authenticated or (self.servicePaused and not probe) or
+                    if (not job or (not job['desired'] and not getattr(self.local, 'pidRecovery', False)) or not self.authenticated or (self.servicePaused and not probe) or
                             getattr(self.local, 'epoch', self.sessionEpoch) != self.sessionEpoch):
                         raise WorkSuspended('Scraping is paused')
                 maximum = self.traffic.ceiling(self.store.setting('parallelRequests', 2))
@@ -262,6 +268,7 @@ class Engine(threading.Thread):
             except WorkSuspended:
                 pass
             finally:
+                self.elapsed.tick(self.store.jobs(), False, save=True)
                 workers.shutdown(wait=True, cancel_futures=True)
                 self.collectWork()
                 self.collectMunicipalityExport(wait=True)
@@ -326,6 +333,7 @@ class Engine(threading.Thread):
             if len(self.inFlight) >= maximum:
                 break
             if job['id'] not in self.inFlight:
+                self.elapsed.tick(self.store.jobs(), self.authenticated, admitted=[job['id']])
                 self.inFlight[job['id']] = workers.submit(self.runUnit, job, recovering)
 
     def reportTraffic(self):
@@ -334,6 +342,7 @@ class Engine(threading.Thread):
         if now - self.lastTrafficReport < 1:
             return
         self.lastTrafficReport = now
+        self.emit('elapsed', self.elapsed.tick(self.store.jobs(), self.authenticated))
         with self.condition:
             payload = {'active': self.activeRequests, 'limit': self.traffic.limit,
                        'configured': self.store.setting('parallelRequests', 2),
@@ -526,6 +535,11 @@ class Engine(threading.Thread):
                 self.emit('datasetInspected', inventory)
             elif action == 'importDataset':
                 self.importDataset(**payload)
+            elif action == 'importPidList':
+                self.pidReference.importWorkbook(payload['path'], self.operationProgress)
+                self.emit('pidListChanged', None)
+            elif action in ('verifyPids', 'fetchMissingPids'):
+                self.runPidOperation(action, **payload)
             elif action == 'exportMunicipality':
                 self.beginMunicipalityExport(**payload)
             elif action == 'delete':
@@ -546,6 +560,11 @@ class Engine(threading.Thread):
                 self.emit('jobsChanged', None)
             else:
                 raise ValueError(f'Unknown worker operation {action}')
+        except WorkSuspended:
+            if action in ('verifyPids', 'fetchMissingPids') and not self.stopEvent.is_set():
+                self.emit('notice', 'PID operation stopped. Saved progress is retained; all jobs remain paused.')
+            else:
+                raise
         except InterruptedError:
             raise
         except AuthenticationError:
@@ -615,6 +634,155 @@ class Engine(threading.Thread):
         if now - getattr(self, 'lastOperationProgress', 0) >= 0.1 or (total > 0 and current == total):
             self.lastOperationProgress = now
             self.emit('operationProgress', {'current': current, 'total': total, 'message': message})
+
+    def runPidOperation(self, action, municipalityId, root=None):
+        '''Pause all work for an explicit local comparison or targeted recovery.'''
+        logging.info('Starting on-demand PID operation')
+        if self.municipalityExport:
+            raise ValueError('Wait for the municipality export to finish')
+        self.pidCancel.clear()
+        catalog = [entry for entry in self.store.catalog('municipality')
+                   if entry['id'] == municipalityId and entry['active']]
+        if len(catalog) != 1:
+            raise ValueError('Match this municipality to the portal catalog first')
+        municipality = catalog[0]
+        jobs = self.store.jobs()
+        self.elapsed.tick(jobs, self.authenticated, save=True)
+        self.store.control([job['id'] for job in jobs if job['desired']], 'pause')
+        self.elapsed.tick(self.store.jobs(), self.authenticated, save=True)
+        self.emit('jobsChanged', None)
+        self.operationProgress(0, 0, 'Pausing all jobs and waiting for current saves...')
+        self.waitForJobs([job['id'] for job in jobs])
+        self.waitForWriter()
+        selectedRoot = str(Path(root).resolve()) if root else None
+        jobRoots = {str(Path(job['folder']).resolve().parent.parent) for job in jobs
+                    if job['municipalityId'] == municipalityId}
+        roots = ([selectedRoot] if selectedRoot else []) + sorted(jobRoots - {selectedRoot})
+        if not roots:
+            raise ValueError('Choose the dataset output root to verify')
+        result = self.pidReference.verify(self.store, municipalityId, municipality['name'], roots, self.pidProgress)
+        if action == 'fetchMissingPids':
+            if not self.authenticated:
+                raise AuthenticationError('Verify your login before fetching missing PIDs')
+            result = self.recoverPids(municipality, result)
+        self.emit('pidVerified', result)
+
+    def pidProgress(self, current, total, message):
+        '''Allow cancellation between bounded verification and recovery steps.'''
+        if self.stopEvent.is_set() or self.pidCancel.is_set():
+            raise WorkSuspended('PID operation stopped; saved progress is retained')
+        self.operationProgress(current, total, message)
+
+    def pidRequest(self, operation, *args, **kwargs):
+        '''Use the shared request gate and bounded retries for recovery requests.'''
+        for attempt in range(3):
+            self.pidProgress(0, 0, 'Fetching missing properties...')
+            try:
+                return self.network(operation, *args, **kwargs)
+            except (AuthenticationError, WorkSuspended):
+                raise
+            except (PortalHttpError, PortalResponseError, OSError, RuntimeError) as exception:
+                if attempt == 2:
+                    raise
+                delay = max(2 ** (attempt + 1), getattr(exception, 'retryAfter', 0),
+                            self.retryUntil - time.monotonic() if self.servicePaused else 0)
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    self.pidProgress(0, 0, 'Portal request failed; waiting before retry...')
+                    self.stopEvent.wait(min(.2, max(0, deadline - time.monotonic())))
+
+    def recoverPids(self, municipality, verification):
+        '''Resolve and save missing properties, then refresh existing Master workbooks.'''
+        logging.info('Fetching verified missing properties')
+        municipalityId = municipality['id']
+        client = self.client
+        colonies = self.pidRequest(client.requestJson, 'GET', '/Widget/GetULBColonySurvey?' +
+                                   parse.urlencode({'fkULBId': municipalityId}), referer=BASEURL)
+        self.validateCatalog(colonies)
+        touched = set()
+        failures = 0
+        fetched = 0
+        cancelled = False
+        lastPid = ''
+        total = verification['missing'] + verification['pending']
+        try:
+            while True:
+                with closing(self.pidReference.connect()) as reference:
+                    targets = reference.execute("SELECT pid FROM results WHERE municipalityId=? AND state!='found' AND pid>? ORDER BY pid LIMIT 100",
+                                                (municipalityId, lastPid)).fetchall()
+                if not targets:
+                    break
+                for target in targets:
+                    pid = target['pid']
+                    lastPid = pid
+                    self.pidProgress(fetched + failures, total, f'Fetching missing properties: {fetched:,} saved; {failures:,} need review')
+                    try:
+                        raw = self.pidRequest(client.lookupPid, municipalityId, pid)
+                        colonyId = str(raw.get('fkColonySurveyId') or '')
+                        matches = [entry for entry in colonies if
+                                   (colonyId and str(entry['Value']) == colonyId) or
+                                   (not colonyId and municipalityKey(entry['Text']) == municipalityKey(raw.get('ColonyName')))]
+                        if len(matches) != 1 or str(matches[0]['Value']) in ('', '0', '-1'):
+                            raise ValueError('The property colony could not be matched uniquely; no destination was guessed')
+                        colony = {'id': str(matches[0]['Value']), 'name': matches[0]['Text']}
+                        job = recoveryJob(self.store, municipality, colony, verification['roots'])
+                        touched.add(job['id'])
+                        identity = queueProperty(self.store, job, raw)
+                        if identity:
+                            parsed = self.pidRequest(client.fetchDetails, raw)
+                            self.store.saveDetail(job['id'], identity, parsed, propertyPhotoUrls(raw, parsed),
+                                                  state=parsed['Detail']['FetchStatus'])
+                            for photo in self.store.propertyPhotos(job['id'], identity):
+                                if photo['state'] == 'pending':
+                                    path = self.pidRequest(client.downloadPhoto, photo['url'], job['folder'], identity)
+                                    self.store.savePhoto(job['id'], identity, photo['url'], path)
+                            if not self.store.finishProperty(job['id'], identity):
+                                raise ValueError('Property processing is still incomplete')
+                            self.store.persistDataset(job['id'])
+                        fetched += 1
+                        self.pidReference.mark(municipalityId, pid, 'found')
+                    except (AuthenticationError, WorkSuspended):
+                        raise
+                    except Exception as exception:
+                        logging.exception('A missing property could not be recovered')
+                        failures += 1
+                        self.pidReference.mark(municipalityId, pid, 'failed', str(exception))
+                        if self.servicePaused:
+                            raise WorkSuspended('Portal is unavailable; retry the remaining PIDs later')
+        except WorkSuspended:
+            cancelled = True
+        finally:
+            # Checkpoints are authoritative even if a locked workbook cannot be replaced.
+            exportErrors = []
+            for jobId in touched:
+                try:
+                    exportJob(self.store, self.store.job(jobId))
+                except Exception as exception:
+                    exportErrors.append(str(exception))
+                    self.store.exportResult(jobId, self.store.job(jobId)['dataVersion'], str(exception))
+            if touched and not exportErrors:
+                jobs = [job for job in self.store.jobs() if job['municipalityId'] == municipalityId]
+                history = self.store.setting('municipalityExports', {})
+                masterRoots = set(verification['roots'])
+                if municipalityId in history:
+                    masterRoots.add(str(Path(history[municipalityId]['path']).parent.parent))
+                for destination in masterRoots:
+                    marker = Path(destination) / 'Master' / f'.municipality-{municipalityId}.json'
+                    if not marker.exists():
+                        continue
+                    try:
+                        exported = exportMunicipality(self.store, jobs, destination, self.operationProgress,
+                                                      sourceRoots=verification['roots'])
+                        history[municipalityId] = exported
+                        self.store.setSetting('municipalityExports', history)
+                        self.emit('pidMasterUpdated', exported)
+                    except Exception as exception:
+                        exportErrors.append(str(exception))
+            self.emit('jobsChanged', None)
+        result = self.pidReference.verify(self.store, municipalityId, municipality['name'], verification['roots'],
+                                          self.operationProgress, preserveErrors=True)
+        result.update(fetched=fetched, failures=failures, cancelled=cancelled, exportErrors=exportErrors)
+        return result
 
     def refreshMunicipalities(self):
         '''Update municipality options from the portal. Inputs: None. Output: None.'''

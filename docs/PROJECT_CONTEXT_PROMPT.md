@@ -2,6 +2,30 @@
 
 Context snapshot: 20 November 2026.
 
+November 24: on-demand reference PID verification and persisted elapsed timers
+are implemented in elapsed.py, pid_verification.py and pid_dialog.py. The GUI
+adds Time elapsed immediately before Status, an Upload PID list split button,
+and Verify data beside each municipality export. Elapsed durations live in
+jobElapsed/municipalityElapsed, not portable job fields: queue deletion/re-add
+resets colony time while ordinary app restarts retain it. One monotonic clock
+counts admitted work/retries, excludes queued/paused/login/offline periods, and
+counts overlapping municipality work once; checkpoints occur on transitions,
+shutdown and every ten seconds. Reference lists/counts/results use a separate
+pid-reference.sqlite3 with streaming imports and conservative catalog matching.
+Verification is explicit only (no live counts or export-triggered comparisons),
+pauses all jobs, drains workers/writer, and compares saved PID indexes across
+queued/retained/legacy colony folders. Results show counts with optional paged
+details. Optional recovery rechecks saved records, uses exact municipality+PID
+searchType=2 lookups, maps missing colony IDs through unique catalog names,
+and leaves ambiguous routes unresolved. It preserves map coverage and existing
+baselines, saves normal details/photos/portable checkpoints/CSV/XLSX, and safely
+rebuilds existing managed Master exports without creating new ones. All jobs
+remain paused. Cancellation and failures retain saved work. Tests cover import
+rollback, pause/restart/reset timing, deleted folders, recovery deduplication,
+map preservation, ambiguous routes and locked Master publication. No Windows
+throughput benchmark has been made; 8 parallel / 250 ms remains the starting
+recommendation. Export schema/formatting rules below are unchanged.
+
 November 24: export schema 12 replaces the unknown-column export fallback with
 explicit EXPORTFIELDS, OWNEREXPORTFIELDS and FLOOREXPORTFIELDS allowlists. Raw
 normalization/checkpoints can retain unfamiliar fields, but compactExportRow and

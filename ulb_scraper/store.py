@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS datasetChanges (
     kind TEXT NOT NULL, recordKey TEXT NOT NULL,
     UNIQUE(jobId,kind,recordKey)
 );
+CREATE TABLE IF NOT EXISTS jobElapsed (
+    jobId TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    seconds REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS municipalityElapsed (
+    municipalityId TEXT PRIMARY KEY, seconds REAL NOT NULL DEFAULT 0
+);
 '''
 
 
@@ -301,6 +308,7 @@ class Store:
             if not replaceAll:
                 connection.executemany('DELETE FROM jobs WHERE municipalityId=?',
                                        [(identity,) for identity in replaceMunicipalities])
+            connection.execute('DELETE FROM municipalityElapsed WHERE municipalityId NOT IN (SELECT municipalityId FROM jobs)')
             for municipality, colony in pairs:
                 identity = uuid.uuid4().hex
                 folder = (Path(rootFolder).resolve() /
@@ -371,6 +379,7 @@ class Store:
         with self.connect() as connection:
             connection.executemany('DELETE FROM jobs WHERE id=?', [(jobId,) for jobId in jobIds])
             connection.executemany('DELETE FROM datasetChanges WHERE jobId=?', [(jobId,) for jobId in jobIds])
+            connection.execute('DELETE FROM municipalityElapsed WHERE municipalityId NOT IN (SELECT municipalityId FROM jobs)')
 
     def persistDataset(self, jobId):
         '''Retain committed colony work independently of the queue. Inputs: <jobId>. Output: None.'''
@@ -555,6 +564,10 @@ class Store:
                 if not identity or identity == 'None':
                     raise ValueError('Property record has no stable identity')
                 mode = job['mode']
+                if mode == 'scrape' and pid and connection.execute(
+                        'SELECT 1 FROM properties WHERE jobId=? AND pid=? AND identity!=?',
+                        (jobId, pid, identity)).fetchone():
+                    continue
                 if job['updateScope'] == 'missing_mobile' and not connection.execute(
                         'SELECT 1 FROM baselines WHERE jobId=? AND pid=? AND mobileTarget=1', (jobId, pid)).fetchone():
                     continue

@@ -16,7 +16,10 @@ from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QMessageBox, QSpinBox
 
+from openpyxl import Workbook
+
 from ulb_scraper.gui import MainWindow
+from ulb_scraper.pid_dialog import PidResultsDialog
 from ulb_scraper.store import Store
 
 
@@ -173,12 +176,12 @@ class GuiTests(unittest.TestCase):
             connection.execute("UPDATE jobs SET mode='update',status='scraping',uniqueCount=2 WHERE id=?", (identity,))
         self.window.refreshJobs()
         self.assertEqual(self.window.queueLabel.text(), 'Update queue')
-        self.assertEqual(self.window.jobItems[identity].text(1), 'Updating: 0/2')
+        self.assertEqual(self.window.jobItems[identity].text(2), 'Updating: 0/2')
         self.addColony('2')
         self.window.refreshJobs()
         self.assertEqual(self.window.queueLabel.text(), 'Scraping / Update queue')
         self.window.dispatchAction(identity, False, 'pause')
-        self.assertEqual(self.window.jobItems[identity].text(1), 'Paused')
+        self.assertEqual(self.window.jobItems[identity].text(2), 'Paused')
 
     def testSuccessfulUpdateImportSetsFolderForNewColonyAdditions(self):
         root = str(self.home / 'imported-dataset')
@@ -292,7 +295,7 @@ class GuiTests(unittest.TestCase):
         self.application.processEvents()
         item = self.window.jobItems[identity]
         rect = self.window.tree.visualItemRect(item)
-        position = QPoint(self.window.tree.columnViewportPosition(4) + 48, rect.center().y())
+        position = QPoint(self.window.tree.columnViewportPosition(5) + 48, rect.center().y())
         QTest.mouseClick(self.window.tree.viewport(), Qt.MouseButton.LeftButton, pos=position)
         self.assertFalse(self.store.job(identity)['desired'])
 
@@ -310,7 +313,7 @@ class GuiTests(unittest.TestCase):
         self.window.handleEvent('session', 'expired')
         self.assertFalse(self.window.validSession)
         self.assertTrue(self.store.job(identity)['desired'])
-        self.assertEqual(self.window.jobItems[identity].text(1), 'Login required')
+        self.assertEqual(self.window.jobItems[identity].text(2), 'Login required')
 
     def testCompactTableRetainsReadableNamesAndActions(self):
         self.addColony()
@@ -320,8 +323,8 @@ class GuiTests(unittest.TestCase):
         self.application.processEvents()
         self.window.fitColumns()
         self.assertGreaterEqual(self.window.tree.columnWidth(0), 225)
-        self.assertEqual(self.window.tree.columnWidth(4), 138)
-        self.assertEqual(self.window.tree.columnCount(), 5)
+        self.assertEqual(self.window.tree.columnWidth(5), 138)
+        self.assertEqual(self.window.tree.columnCount(), 6)
 
 
     def testSearchAndMouseChecksKeepSelectionAcrossFiltering(self):
@@ -415,14 +418,14 @@ class GuiTests(unittest.TestCase):
                 completedCount=10, coverage=0.5625, tileDone=9, tileTotal=16 WHERE id=?""", (jobId,))
         self.window.refreshJobs()
         item = self.window.jobItems[jobId]
-        self.assertEqual(item.text(1), 'Processing: 10/36')
-        coverage = item.text(2)
+        self.assertEqual(item.text(2), 'Processing: 10/36')
+        coverage = item.text(3)
         with self.store.connect() as connection:
             connection.execute('UPDATE jobs SET completedCount=11 WHERE id=?', (jobId,))
         self.window.refreshJobs()
-        self.assertEqual(item.text(1), 'Processing: 11/36')
-        self.assertEqual(item.text(2), coverage)
-        self.assertIn('details and photos', item.toolTip(1))
+        self.assertEqual(item.text(2), 'Processing: 11/36')
+        self.assertEqual(item.text(3), coverage)
+        self.assertIn('details and photos', item.toolTip(2))
 
     def testAllChecksActiveOptionsAndUncheckingOneClearsAllFlag(self):
         combo = self.window.municipality
@@ -473,3 +476,54 @@ class GuiTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def testElapsedColumnPrecedesStatusAndShowsMunicipalityUnionTime(self):
+        identity = self.addColony()
+        self.window.refreshJobs()
+        self.window.handleEvent('elapsed', {'colonies': {identity: 3661}, 'municipalities': {'60': 3600}})
+        self.assertEqual(self.window.tree.headerItem().text(1), 'Time elapsed')
+        self.assertEqual(self.window.tree.headerItem().text(2), 'Status')
+        self.assertEqual(self.window.jobItems[identity].text(1), '01:01:01')
+        self.assertEqual(self.window.groupItems['60'].text(1), '01:00:00')
+
+    def testPidImportEnablesOnlyMatchedVerifyButtonAndMenuIncludesUnknownNames(self):
+        self.addColony()
+        self.window.refreshJobs()
+        self.assertFalse(self.window.groupVerifyButtons['60'].isEnabled())
+        workbook = Workbook()
+        workbook.active.append(['PANCHKULA', 'Unknown'])
+        workbook.active.append(['A', 'B'])
+        path = self.home / 'pids.xlsx'
+        workbook.save(path)
+        self.window.engine.pidReference.importWorkbook(path, lambda *args: None)
+        self.window.handleEvent('pidListChanged', None)
+        self.assertTrue(self.window.groupVerifyButtons['60'].isEnabled())
+        self.assertEqual(len(self.window.pidSummaries), 2)
+        self.assertEqual(self.window.pidSummaries[1]['municipalityId'], None)
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Ok):
+            self.window.verifyPids('60')
+        self.assertIn('verifyPids', self.window.busyActions)
+        self.assertFalse(self.window.tree.isEnabled())
+        self.assertFalse(self.window.operationPanel.isHidden())
+        self.window.cancelPidButton.click()
+        self.assertTrue(self.window.engine.pidCancel.is_set())
+
+    def testPidReportKeepsDetailsCollapsedAndLoadsOnlyOnePage(self):
+        workbook = Workbook()
+        workbook.active.append(['PANCHKULA'])
+        for index in range(250):
+            workbook.active.append([f'PID{index}'])
+        path = self.home / 'pids.xlsx'
+        workbook.save(path)
+        reference = self.window.engine.pidReference
+        reference.importWorkbook(path, lambda *args: None)
+        result = reference.verify(self.store, '60', 'PANCHKULA', [str(self.home)], lambda *args: None)
+        dialog = PidResultsDialog(self.window, result)
+        self.assertTrue(dialog.details.isHidden())
+        self.assertIn('Missing: 250', dialog.counts.text())
+        self.assertEqual(dialog.table.topLevelItemCount(), 0)
+        dialog.more.click()
+        self.assertEqual(dialog.table.topLevelItemCount(), 100)
+        dialog.next.click()
+        self.assertEqual(dialog.offset, 100)
+        dialog.close()

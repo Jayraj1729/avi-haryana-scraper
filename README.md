@@ -96,6 +96,39 @@ Historical records do not inflate speed; paused runs show zero. Map coverage can
 stay fixed while details and photos are processed. During that time the status
 shows `Processing: completed/discovered`; coverage advances with map tiles.
 
+### Elapsed Time And PID Verification
+
+- **Time elapsed**, before Status, records processing time for each colony and
+  municipality. It includes retries and portal waiting after a colony starts,
+  and excludes initial queue time, manual pauses, login waiting and app downtime.
+  Municipality totals count overlapping colony activity once. Timers survive
+  reopening the app; deleting and re-adding a job resets its colony timer.
+  Time before this feature was installed cannot be reconstructed.
+- **Upload PID list**, beside Update data, reads the first worksheet of an XLSX
+  file: municipality names in row 1, PIDs below each name. Duplicate PIDs within
+  a municipality count once. Its dropdown shows counts and marks unmatched or
+  ambiguous municipality names red. Correct those names in the workbook and
+  upload again; matching uses the portal catalog refreshed after login.
+- **Verify data** is enabled beside municipalities with a matched reference
+  list. Municipalities without queued jobs can be selected from the PID list
+  dropdown. Verification pauses all jobs, then checks the selected output root
+  and queued municipality roots, including saved colonies removed from the UI.
+  Counts are updated only on request, never continuously or automatically on
+  export. The results show counts first; **More details** opens a paginated list.
+- **Fetch missing PIDs** rechecks the comparison, then retrieves missing and
+  incomplete properties through the shared request limits and bounded retries.
+  Municipality/PID matches must be exact; colonies must resolve uniquely through
+  their portal ID or catalog name. Unresolved lookups stay available for review.
+  Successful properties, details and photos are saved in their colony datasets
+  without resetting map coverage. Existing Master workbooks are rebuilt; a
+  Master workbook is not created until the user first exports that municipality.
+  If Excel prevents replacement, saved colony data remains intact and the app
+  asks for another export. All jobs stay paused until manually resumed.
+- Windows and macOS use the same scraping and request scheduling logic. Start
+  with **8 parallel requests / 250 ms**. Portal/network latency usually governs
+  speed; storage, antivirus and power settings can affect file saving. No
+  Windows-specific maximum throughput has been measured.
+
 ### Property Columns
 
 The first columns contain PID, municipality/colony, ownership, court-case flag,

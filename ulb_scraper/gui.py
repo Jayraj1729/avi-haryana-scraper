@@ -17,9 +17,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                               QLineEdit, QListView, QMainWindow, QMenu, QMessageBox, QPushButton,
                               QProgressBar, QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStylePainter,
                               QSystemTrayIcon, QToolButton, QToolTip,
-                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QWidgetAction)
 
+from ulb_scraper.elapsed import formatElapsed
 from ulb_scraper.engine import Engine
+from ulb_scraper.pid_dialog import PidResultsDialog
 
 
 STATUSLABELS = {
@@ -56,6 +58,11 @@ QPushButton#primary:hover { background: #05654f; }
 QPushButton#primary:disabled { background: #96b7ae; border-color: #96b7ae; }
 QToolButton { border: none; border-radius: 3px; padding: 5px; }
 QToolButton:hover { background: #dfece7; }
+QToolButton#pidList { border: 1px solid #c9d3d6; border-radius: 4px; padding: 9px 30px 9px 14px; background: #ffffff; }
+QToolButton#pidList:hover { background: #edf4f2; border-color: #5f978a; }
+QToolButton#pidList:disabled { color: #9ca6a9; border-color: #dce2e4; background: #f1f4f5; }
+QToolButton#pidList::menu-button { subcontrol-origin: border; subcontrol-position: top right; width: 22px; border: none; border-left: 1px solid #c9d3d6; background: transparent; }
+QToolButton#pidList::menu-button:disabled { border-left-color: #dce2e4; }
 QTreeWidget { background: white; border: 1px solid #dae1e3; outline: 0; alternate-background-color: #fafcfc; }
 QTreeWidget::item { height: 46px; border-bottom: 1px solid #eef1f2; }
 QTreeWidget::item:selected { background: #e1f0eb; color: #172c28; }
@@ -306,6 +313,9 @@ class MainWindow(QMainWindow):
         self.jobItems = {}
         self.groupItems = {}
         self.groupExportLabels = {}
+        self.groupVerifyButtons = {}
+        self.elapsedValues = {'colonies': {}, 'municipalities': {}}
+        self.pidSummaries = []
         self.municipalityExports = self.store.setting('municipalityExports', {})
         self.jobsById = {}
         self.speedSamples = deque()
@@ -318,6 +328,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.buildWindow()
         self.loadMunicipalities()
+        self.refreshPidList()
+        self.elapsedValues = {'colonies': dict(self.engine.elapsed.colonies), 'municipalities': dict(self.engine.elapsed.municipalities)}
         self.refreshJobs()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refreshJobs)
@@ -376,11 +388,21 @@ class MainWindow(QMainWindow):
         self.updateButton.setToolTip('Validate an existing output folder and update its municipality/colony datasets')
         self.updateButton.clicked.connect(self.chooseUpdateFolder)
         login.addWidget(self.updateButton)
+        self.pidButton = QToolButton()
+        self.pidButton.setObjectName('pidList')
+        self.pidButton.setText('Upload PID list')
+        self.pidButton.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.pidButton.clicked.connect(self.choosePidList)
+        self.pidMenu = QMenu(self.pidButton)
+        self.pidButton.setMenu(self.pidMenu)
+        login.addWidget(self.pidButton)
         logs = QPushButton('Logs')
         logs.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         logs.clicked.connect(lambda: self.openFolder(self.home / 'logs'))
         login.addWidget(logs)
         layout.addLayout(login)
+        self.updateButton.ensurePolished()
+        self.pidButton.setFixedHeight(self.updateButton.sizeHint().height())
 
         selection = QWidget()
         selection.setObjectName('selection')
@@ -442,22 +464,22 @@ class MainWindow(QMainWindow):
         layout.addLayout(toolbar)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(['Municipality / Colony', 'Status', 'Map coverage', 'Properties', 'Actions'])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(['Municipality / Colony', 'Time elapsed', 'Status', 'Map coverage', 'Properties', 'Actions'])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.setUniformRowHeights(False)
         self.tree.setIndentation(22)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.showJobMenu)
-        widths = [280, 210, 135, 105, 138]
+        widths = [510, 105, 210, 135, 105, 138]
         for column, width in enumerate(widths):
             self.tree.header().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.tree.setColumnWidth(column, width)
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.tree.setItemDelegateForColumn(4, ActionDelegate(self))
+        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.tree.setItemDelegateForColumn(5, ActionDelegate(self))
         self.tree.header().setSectionsClickable(True)
         self.tree.header().sectionClicked.connect(self.sortJobs)
         self.sortColumn = 0
@@ -488,6 +510,10 @@ class MainWindow(QMainWindow):
         operationLayout.addWidget(self.operationLabel, 1)
         operationLayout.addWidget(self.operationProgress)
         layout.addWidget(self.operationPanel)
+        self.cancelPidButton = QPushButton('Stop PID operation')
+        self.cancelPidButton.clicked.connect(self.engine.pidCancel.set)
+        operationLayout.addWidget(self.cancelPidButton)
+        self.cancelPidButton.hide()
         self.operationPanel.hide()
         self.dataFolderNote = QLabel('Keep this output folder unchanged. To work with the data, copy the full folder and use the copy.')
         self.dataFolderNote.setWordWrap(True)
@@ -525,16 +551,20 @@ class MainWindow(QMainWindow):
             return
         self.busyActions.add(action)
         self.engine.submit(action, **payload)
-        if action in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality'):
+        if action in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids'):
             self.tree.setEnabled(False)
             self.municipality.setEnabled(False)
             self.colony.setEnabled(False)
-        if action in ('inspectDataset', 'importDataset', 'delete', 'exportMunicipality'):
+        if action in ('inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids'):
             self.operationLabel.setText({'inspectDataset': 'Validating dataset folders...',
                 'importDataset': 'Preparing update jobs...', 'delete': 'Removing jobs safely...',
-                'exportMunicipality': 'Preparing municipality export...'}[action])
+                'exportMunicipality': 'Preparing municipality export...',
+                'importPidList': 'Reading reference PID workbook...',
+                'verifyPids': 'Pausing all jobs before verification...',
+                'fetchMissingPids': 'Preparing missing PID recovery...'}[action])
             self.operationProgress.setRange(0, 0)
             self.operationPanel.show()
+            self.cancelPidButton.setVisible(action in ('verifyPids', 'fetchMissingPids'))
         self.updateAddButton()
 
     def exportMunicipality(self, municipalityId):
@@ -560,6 +590,67 @@ class MainWindow(QMainWindow):
             if not root:
                 return
         self.request('exportMunicipality', municipalityId=municipalityId, destinationRoot=root)
+
+    def choosePidList(self):
+        '''Import municipality columns from a reference workbook without starting work.'''
+        logging.info('Choosing a reference PID workbook')
+        if self.busyActions or self.closing:
+            return
+        path, unused = QFileDialog.getOpenFileName(self, 'Upload municipality PID list', '', 'Excel workbook (*.xlsx)')
+        if path:
+            self.request('importPidList', path=path)
+
+    def refreshPidList(self):
+        '''Show municipality counts and mark unknown names in red.'''
+        logging.debug('Refreshing imported PID municipality menu')
+        self.pidSummaries = self.engine.pidReference.summary(self.store.catalog('municipality'))
+        self.pidMenu.clear()
+        upload = self.pidMenu.addAction('Upload / replace PID list...')
+        upload.triggered.connect(self.choosePidList)
+        self.pidMenu.addSeparator()
+        for entry in self.pidSummaries:
+            label = f'{entry["name"].upper()} ({entry["count"]:,} PIDs)'
+            if entry['municipalityId'] is None:
+                unknown = QWidgetAction(self.pidMenu)
+                text = QLabel(label + ' — unknown or ambiguous municipality')
+                text.setStyleSheet('color: #b42318; padding: 8px;')
+                unknown.setDefaultWidget(text)
+                self.pidMenu.addAction(unknown)
+            else:
+                action = self.pidMenu.addAction(label)
+                action.triggered.connect(lambda checked=False, identity=entry['municipalityId']: self.verifyPids(identity))
+        if not self.pidSummaries:
+            empty = self.pidMenu.addAction('No PID list uploaded')
+            empty.setEnabled(False)
+        for identity, button in self.groupVerifyButtons.items():
+            button.setEnabled(any(entry['municipalityId'] == identity for entry in self.pidSummaries))
+
+    def verifyPids(self, municipalityId):
+        '''Confirm an on-demand comparison, including saved colonies absent from the queue.'''
+        logging.info('Requesting PID verification')
+        if self.busyActions or self.closing:
+            return
+        if QMessageBox.question(self, 'Verify saved data',
+                'Pause all jobs and verify this municipality against all saved colony folders? '
+                'No properties will be fetched during verification. Jobs will stay paused until you resume them.',
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            return
+        self.request('verifyPids', municipalityId=municipalityId, root=self.folder.text())
+
+    def fetchMissingPids(self, result):
+        '''Confirm targeted recovery and refresh existing municipality Master exports.'''
+        logging.info('Confirming missing PID recovery')
+        if not self.validSession or self.closing:
+            QMessageBox.information(self, 'Login required', 'Verify your login before fetching missing PIDs.')
+            return False
+        if QMessageBox.question(self, 'Fetch missing PIDs',
+                'Fetch missing and incomplete properties, including their details and photos? '
+                'Their colony datasets will be updated, and an existing Master workbook will be rebuilt. '
+                'This may include colonies that were not added to the queue. All jobs will remain paused.',
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            return False
+        self.request('fetchMissingPids', municipalityId=result['municipalityId'], root=result['roots'][0])
+        return True
 
     def municipalityExportComplete(self, result):
         '''Show the saved workbook, row count and an Open folder shortcut.'''
@@ -593,13 +684,23 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         label = QLabel(name)
         label.setStyleSheet('font-weight: bold;')
+        label.setMaximumWidth(155)
+        label.setToolTip(name)
         layout.addWidget(label)
         button = QPushButton('Export Excel')
         button.setStyleSheet('padding: 3px 6px; font-size: 11px;')
         button.setToolTip('Pause this municipality and export all saved colony data to Master')
         button.clicked.connect(lambda checked=False: self.exportMunicipality(municipalityId))
         layout.addWidget(button)
+        verify = QPushButton('Verify data')
+        verify.setStyleSheet('padding: 3px 6px; font-size: 11px;')
+        verify.clicked.connect(lambda checked=False: self.verifyPids(municipalityId))
+        verify.setEnabled(any(entry['municipalityId'] == municipalityId for entry in self.pidSummaries))
+        verify.setToolTip('Pause all jobs and compare the uploaded PID list with all saved colonies')
+        self.groupVerifyButtons[municipalityId] = verify
+        layout.addWidget(verify)
         lastExport = QLabel()
+        lastExport.setMinimumWidth(100)
         lastExport.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lastExport.setStyleSheet('font-size: 10px; color: #53666c;')
         layout.addWidget(lastExport, 1)
@@ -694,7 +795,7 @@ class MainWindow(QMainWindow):
         self.colony.blockSignals(True)
         self.colony.clear()
         self.colony.setEnabled(bool(municipalities) and self.municipality.selectedValues() != ['ALL']
-                               and not self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')))
+                               and not self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')))
         self.colony.addItem('Select colonies', '')
         if municipalities:
             self.colony.addItem('ALL colonies', 'ALL')
@@ -749,10 +850,11 @@ class MainWindow(QMainWindow):
         logging.debug('Updating Add availability')
         if not hasattr(self, 'addButton'):
             return
-        queueBusy = bool(self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')))
+        queueBusy = bool(self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')))
         self.addButton.setEnabled(bool(self.validSession and self.selectedColonies() and not queueBusy))
         self.addButton.setText('Adding...' if 'add' in self.busyActions else 'Add')
         self.updateButton.setEnabled(not queueBusy and 'inspectDataset' not in self.busyActions)
+        self.pidButton.setEnabled(not queueBusy)
 
     def chooseFolder(self):
         '''Persist the folder for subsequent jobs. Inputs: None. Output: None.'''
@@ -864,7 +966,7 @@ class MainWindow(QMainWindow):
     def controlJobs(self, identifiers, action):
         '''Apply parent, child, or global start/pause controls. Inputs: <identifiers>, <action>. Output: None.'''
         logging.info(f'Applying {action} control')
-        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
+        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')):
             return
         self.store.control(identifiers, action)
         self.refreshJobs()
@@ -889,7 +991,7 @@ class MainWindow(QMainWindow):
     def dispatchAction(self, identity, isGroup, action):
         '''Resolve current job membership when a row action is activated. Inputs: <identity>, <isGroup>, <action>.'''
         logging.info(f'Activating row action {action}')
-        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
+        if self.closing or self.busyActions.intersection(('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')):
             return
         identifiers = self.groupIds(identity) if isGroup else [identity]
         if action in ('start', 'pause'):
@@ -910,7 +1012,7 @@ class MainWindow(QMainWindow):
         identifiers = self.groupIds(identity) if isGroup else [identity]
         jobs = [self.jobsById[jobId] for jobId in identifiers if jobId in self.jobsById]
         menu = QMenu(self)
-        delegate = self.tree.itemDelegateForColumn(4)
+        delegate = self.tree.itemDelegateForColumn(5)
         for action, label, icon in delegate.actions:
             entry = menu.addAction(self.style().standardIcon(icon), label)
             entry.setEnabled(delegate.enabled(action, jobs))
@@ -965,6 +1067,7 @@ class MainWindow(QMainWindow):
             if municipalityId not in grouped:
                 parent = self.groupItems.pop(municipalityId)
                 self.groupExportLabels.pop(municipalityId, None)
+                self.groupVerifyButtons.pop(municipalityId, None)
                 self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(parent))
             else:
                 self.updateGroupItem(self.groupItems[municipalityId], grouped[municipalityId])
@@ -1021,25 +1124,27 @@ class MainWindow(QMainWindow):
                           'complete': 'Update complete', 'complete_warnings': 'Updated with warnings'}.get(status, statusText)
             if status == 'scraping' and job['uniqueCount'] == job['completedCount']:
                 statusText = 'Updating map'
-        values = [job['colonyName'], statusText,
+        values = [job['colonyName'], formatElapsed(self.elapsedValues['colonies'].get(job['id'], 0)), statusText,
                   f'{coverage:.1f}%' if job['tileTotal'] else '-', f'{job["uniqueCount"]:,}']
         for column, value in enumerate(values):
             item.setText(column, value)
-        for column, value in [(2, coverage), (3, job['uniqueCount'])]:
+        for column, value in [(3, coverage), (4, job['uniqueCount'])]:
             item.setData(column, Qt.ItemDataRole.UserRole, value)
+        item.setData(1, Qt.ItemDataRole.UserRole, self.elapsedValues['colonies'].get(job['id'], 0))
+        item.setToolTip(1, 'Processing time includes retries. Queued time, manual pauses and time with the app closed are excluded.')
         colors = {'complete': '#087962', 'error': '#b34343', 'waiting_login': '#a56b16', 'retrying': '#a56b16'}
-        item.setForeground(1, QColor(colors.get(status, '#53666c')))
+        item.setForeground(2, QColor(colors.get(status, '#53666c')))
         if job['exportError']:
-            item.setText(1, 'Excel save pending')
-            item.setForeground(1, QColor('#b34343'))
-        item.setToolTip(1, job['exportError'] or job['error'] or (
+            item.setText(2, 'Excel save pending')
+            item.setForeground(2, QColor('#b34343'))
+        item.setToolTip(2, job['exportError'] or job['error'] or (
             'Processing details and photos for discovered properties; map coverage advances after the next map tile.'
             if status == 'scraping' and job['uniqueCount'] > job['completedCount'] else ''))
-        item.setToolTip(2, f'Map tiles: {job["tileDone"]:,} / {job["tileTotal"]:,}. '
+        item.setToolTip(3, f'Map tiles: {job["tileDone"]:,} / {job["tileTotal"]:,}. '
                           'Coverage stays fixed while discovered properties finish their details and photos.')
-        item.setToolTip(3, f'{job["completedCount"]:,} fully processed / {job["uniqueCount"]:,} discovered' +
+        item.setToolTip(4, f'{job["completedCount"]:,} fully processed / {job["uniqueCount"]:,} discovered' +
                           (f'; {job["baselineCount"]:,} previous records retained during update' if job['mode'] == 'update' else ''))
-        item.setToolTip(4, job['folder'])
+        item.setToolTip(5, job['folder'])
 
     def updateGroupItem(self, parent, jobs):
         '''Aggregate a municipality's jobs and scoped controls. Inputs: <parent>, <jobs>. Output: None.'''
@@ -1054,14 +1159,18 @@ class MainWindow(QMainWindow):
         if label.text() != text:
             label.setText(text)
             label.setToolTip(f'{text}\n{exported["path"]}' if exported else 'Export all saved properties collected so far')
+        seconds = self.elapsedValues['municipalities'].get(municipalityId, 0)
+        parent.setText(1, formatElapsed(seconds))
+        parent.setData(1, Qt.ItemDataRole.UserRole, seconds)
+        parent.setToolTip(1, 'Elapsed processing time; overlapping colony activity is counted once.')
         active = sum(bool(job['desired']) for job in jobs)
         complete = sum(job['status'] in ('complete', 'complete_warnings') for job in jobs)
         coverage = sum(job['coverage'] for job in jobs) / len(jobs) * 100
-        parent.setText(1, f'{complete} / {len(jobs)} complete')
-        parent.setText(2, f'{min(100, coverage):.1f}%')
-        parent.setText(3, f'{sum(job["uniqueCount"] for job in jobs):,}')
-        parent.setData(2, Qt.ItemDataRole.UserRole, coverage)
-        for column, key in [(3, 'uniqueCount')]:
+        parent.setText(2, f'{complete} / {len(jobs)} complete')
+        parent.setText(3, f'{min(100, coverage):.1f}%')
+        parent.setText(4, f'{sum(job["uniqueCount"] for job in jobs):,}')
+        parent.setData(3, Qt.ItemDataRole.UserRole, coverage)
+        for column, key in [(4, 'uniqueCount')]:
             parent.setData(column, Qt.ItemDataRole.UserRole, sum(job[key] for job in jobs))
 
     def filterJobs(self):
@@ -1142,12 +1251,32 @@ class MainWindow(QMainWindow):
         logging.debug(f'Handling worker event {event}')
         if self.closing and event != 'stopped':
             return
-        if event == 'operationProgress':
+        if event == 'elapsed':
+            self.elapsedValues = payload
+            for jobId, item in self.jobItems.items():
+                seconds = payload['colonies'].get(jobId, 0)
+                item.setText(1, formatElapsed(seconds))
+                item.setData(1, Qt.ItemDataRole.UserRole, seconds)
+            for identity, parent in self.groupItems.items():
+                seconds = payload['municipalities'].get(identity, 0)
+                parent.setText(1, formatElapsed(seconds))
+                parent.setData(1, Qt.ItemDataRole.UserRole, seconds)
+        elif event == 'pidListChanged':
+            self.refreshPidList()
+        elif event == 'pidVerified':
+            self.busyActions.discard('verifyPids')
+            self.busyActions.discard('fetchMissingPids')
+            self.refreshJobs()
+            PidResultsDialog(self, payload).exec()
+        elif event == 'pidMasterUpdated':
+            self.municipalityExports[payload['municipalityId']] = payload
+            self.refreshJobs()
+        elif event == 'operationProgress':
             self.operationLabel.setText(payload['message'])
             total = payload['total']
             self.operationProgress.setRange(0, total if total > 0 else 0)
             self.operationProgress.setValue(payload['current'] if total > 0 else 0)
-            if self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
+            if self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')):
                 self.operationPanel.show()
         elif event == 'traffic':
             self.trafficState = payload
@@ -1189,6 +1318,7 @@ class MainWindow(QMainWindow):
         elif event == 'catalog':
             if payload['kind'] == 'municipality':
                 self.loadMunicipalities()
+                self.refreshPidList()
             elif payload['parent'] in self.selectedMunicipalities():
                 self.loadColonies()
         elif event == 'jobsChanged':
@@ -1206,7 +1336,7 @@ class MainWindow(QMainWindow):
             self.notice.setText(payload)
         elif event == 'actionFailed':
             self.notice.setText(payload['message'])
-            if payload['action'] in ('inspectDataset', 'importDataset', 'exportMunicipality'):
+            if payload['action'] in ('inspectDataset', 'importDataset', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids'):
                 QMessageBox.warning(self, 'Municipality export' if payload['action'] == 'exportMunicipality' else 'Dataset update', payload['message'])
             if payload['action'] == 'verifyOtp' and self.otpDialog:
                 self.otpDialog.message.setText(payload['message'])
@@ -1217,13 +1347,13 @@ class MainWindow(QMainWindow):
             if payload == 'generateOtp':
                 self.otpButton.setEnabled(True)
                 self.phone.setEnabled(True)
-            if payload in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality') and not self.busyActions.intersection(
-                    ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
+            if payload in ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids') and not self.busyActions.intersection(
+                    ('add', 'inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')):
                 self.tree.setEnabled(True)
                 self.municipality.setEnabled(True)
                 self.colony.setEnabled(bool(self.selectedMunicipalities()) and
                                        self.municipality.selectedValues() != ['ALL'])
-            if not self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality')):
+            if not self.busyActions.intersection(('inspectDataset', 'importDataset', 'delete', 'exportMunicipality', 'importPidList', 'verifyPids', 'fetchMissingPids')):
                 self.operationPanel.hide()
             self.updateAddButton()
         elif event == 'stopped' and self.closing:
@@ -1271,9 +1401,9 @@ class MainWindow(QMainWindow):
     def fitColumns(self):
         '''Keep names and actions readable in compact windows. Inputs: None. Output: None.'''
         logging.debug('Fitting table columns')
-        otherWidth = sum(self.tree.columnWidth(column) for column in range(1, 5)
+        otherWidth = sum(self.tree.columnWidth(column) for column in range(1, 6)
                          if not self.tree.isColumnHidden(column))
-        self.tree.setColumnWidth(0, max(325, self.tree.viewport().width() - otherWidth - 2))
+        self.tree.setColumnWidth(0, max(510, self.tree.viewport().width() - otherWidth - 2))
 
 
 class JobItem(QTreeWidgetItem):
@@ -1281,7 +1411,7 @@ class JobItem(QTreeWidgetItem):
 
     def __lt__(self, other):
         column = self.treeWidget().sortColumn()
-        if column in (2, 3):
+        if column in (1, 3, 4):
             return (self.data(column, Qt.ItemDataRole.UserRole) or 0) < (other.data(column, Qt.ItemDataRole.UserRole) or 0)
         return self.text(column).casefold() < other.text(column).casefold()
 

@@ -89,10 +89,10 @@ def checkpointRows(connection, job, folder):
         yield row, not state or state['processingState'] != 'error'
 
 
-def collectFolders(jobs, municipalityId):
+def collectFolders(jobs, municipalityId, sourceRoots=()):
     '''Include saved sibling colonies even when they are absent from the queue.'''
     logging.info('Finding saved municipality colony folders')
-    roots = {Path(job['folder']).resolve().parent.parent for job in jobs}
+    roots = {Path(job['folder']).resolve().parent.parent for job in jobs} | {Path(root).resolve() for root in sourceRoots}
     folders = {Path(job['folder']).resolve() for job in jobs}
     for root in roots:
         if not root.exists():
@@ -156,7 +156,7 @@ def publishWorkbook(temporary, destination, marker, metadata):
         backup.unlink()
 
 
-def exportMunicipality(store, jobs, destinationRoot, progress=None):
+def exportMunicipality(store, jobs, destinationRoot, progress=None, sourceRoots=()):
     '''
     Build one deduplicated workbook from every saved colony in a municipality.
 
@@ -176,7 +176,7 @@ def exportMunicipality(store, jobs, destinationRoot, progress=None):
     filename = f'{slugify(municipalityName)}_{stamp:%Y%m%d_%H%M%S_%f}.xlsx'
     workbookPath = destination / filename
     marker = destination / f'.municipality-{municipalityId}.json'
-    folders = collectFolders(jobs, municipalityId)
+    folders = collectFolders(jobs, municipalityId, sourceRoots)
     queued = {Path(job['folder']).resolve(): job for job in jobs}
     report = progress or (lambda *args: None)
     workbook = Workbook(write_only=True)
